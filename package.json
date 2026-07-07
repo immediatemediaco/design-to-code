@@ -1,10 +1,30 @@
 {
+  "name": "design-to-code",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Root orchestration package for the design-to-code docker stack",
+  "scripts": {
+    "setup": "yarn util:install && yarn util:build-env:local && yarn start",
+    "start": "yarn stop && yarn start:dev",
+    "stop": "if [ -f docker-compose.yaml ]; then docker compose down --remove-orphans --volumes; fi && docker network prune -f",
+    "compose:build": "docker compose --env-file .env --env-file .env.local build app relay nginx cache && docker compose --env-file .env --env-file .env.local build",
+    "compose:up": "docker compose --env-file .env --env-file .env.local up -d --build --remove-orphans --force-recreate",
+    "start:dev": "yarn start:reverse-proxy && ./docker-compose-generator.sh && yarn compose:build && yarn compose:up && yarn util:is-ready",
+    "start:prod": "yarn start:reverse-proxy && ./docker-compose-generator.sh --prod && yarn compose:build && yarn compose:up && yarn util:is-ready",
+    "start:reverse-proxy": "yarn start-reverse-proxy",
+    "logs": "docker compose logs -f app relay nginx cache",
+    "plugin:build": "yarn tsc --project figma-plugin/tsconfig.json",
+    "util:install": "yarn install --frozen-lockfile",
+    "util:build-env:local": "touch .env.local && touch relay-server/.env.local && touch storybook-app/.env.local",
+    "util:is-ready": "yarn is-container-ready -f docker-compose.yaml -k app -m 'ready in'"
+  },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.107.0"
+    "@immediate_media/docker-templates": "^5.5.0",
+    "@immediate_media/local-reverse-proxy-orchestrator": "^1.3.1",
+    "@immediate_media/symfony-pipeline-scripts": "^1.2.4"
   },
   "devDependencies": {
     "@figma/plugin-typings": "^1.130.0",
-    "dotenv": "^17.4.2",
     "typescript": "^6.0.3"
   }
 }

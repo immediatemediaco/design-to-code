@@ -3,19 +3,27 @@ import cors from 'cors';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import 'dotenv/config';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 import Anthropic from '@anthropic-ai/sdk';
-
-const anthropic = new Anthropic();
+import OpenAI from 'openai';
+import type {
+  ResponseInputImage,
+  ResponseInputMessageContentList,
+  ResponseInputText,
+} from 'openai/resources/responses/responses';
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const GENERATED_DIR = path.resolve(__dirname, '../storybook-app/src/components/Generated');
+const GENERATED_DIR = path.resolve(
+  process.env.GENERATED_DIR ?? path.resolve(__dirname, '../storybook-app/src/components/Generated'),
+);
+const INDEX_CSS_PATH = path.resolve(
+  process.env.STORYBOOK_INDEX_CSS_PATH ?? path.resolve(__dirname, '../storybook-app/src/index.css'),
+);
 
 const SYSTEM_PROMPT = `You generate a single React functional component in TypeScript (TSX) from a Figma design description.
 
@@ -30,103 +38,279 @@ Rules:
 - Do not invent props or external dependencies. No imports beyond React itself.
 - When the user provides additional instructions, prioritise satisfying them while keeping the component visually close to the original design.`;
 
-type HistoryEntry = Anthropic.MessageParam;
+const DEFAULT_MODEL_BY_PROVIDER = {
+  anthropic: 'claude-sonnet-4-6',
+  openai: 'gpt-5-codex',
+} as const;
+const CODEX_AUTH_PATH = process.env.CODEX_AUTH_PATH ?? path.join(process.env.HOME ?? '/root', '.codex/auth.json');
+const generatedCodeByComponent = new Map<string, string>();
+type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
-const conversationHistory = new Map<string, HistoryEntry[]>();
+class LlmConfigurationError extends Error {}
 
 function extractCode(responseText: string): string {
   const fenceMatch = responseText.match(/```(?:tsx|jsx|ts|js)?\n([\s\S]*?)```/);
   return fenceMatch ? (fenceMatch[1] ?? '').trim() : responseText.trim();
 }
 
+function getConfiguredModel(provider: LlmProvider) {
+  return DEFAULT_MODEL_BY_PROVIDER[provider];
+}
+
+function findOpenAIToken(value: unknown): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  if (typeof value === 'string') {
+    return value.trim() || undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const token = findOpenAIToken(item);
+      if (token) {
+        return token;
+      }
+    }
+
+    return undefined;
+  }
+
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const preferredKeys = ['api_key', 'apikey', 'key', 'access_token', 'token', 'id_token'];
+
+    for (const key of preferredKeys) {
+      const token = findOpenAIToken(record[key]);
+      if (token) {
+        return token;
+      }
+    }
+
+    for (const nestedValue of Object.values(record)) {
+      const token = findOpenAIToken(nestedValue);
+      if (token) {
+        return token;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function getCodexAuthToken() {
+  try {
+    const rawAuth = await fs.readFile(CODEX_AUTH_PATH, 'utf-8');
+    const parsedAuth = JSON.parse(rawAuth) as unknown;
+    return findOpenAIToken(parsedAuth);
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error.code === 'ENOENT' || error.code === 'EISDIR')
+    ) {
+      return undefined;
+    }
+
+    throw new LlmConfigurationError(`Unable to read Codex auth file at ${CODEX_AUTH_PATH}`);
+  }
+}
+
+async function resolveLlmConfig() {
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim();
+  const openaiApiKey = process.env.OPENAI_API_KEY?.trim() ?? (await getCodexAuthToken());
+
+  if (anthropicApiKey) {
+    return {
+      provider: 'anthropic' as const,
+      apiKey: anthropicApiKey,
+      model: getConfiguredModel('anthropic'),
+    };
+  }
+
+  if (openaiApiKey) {
+    return {
+      provider: 'openai' as const,
+      apiKey: openaiApiKey,
+      model: getConfiguredModel('openai'),
+    };
+  }
+
+  throw new LlmConfigurationError(
+    'LLM credentials required: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or mount ~/.codex/auth.json',
+  );
+}
+
+function buildGenerationPrompt(
+  componentName: string,
+  nodeTree: unknown,
+  prompt: string | undefined,
+  previousCode: string | undefined,
+) {
+  const sections = [
+    `Generate a React component named "${componentName}".`,
+    `Figma node tree:\n${JSON.stringify(nodeTree, null, 2)}`,
+  ];
+
+  if (previousCode) {
+    sections.push(
+      `Current implementation to update:\n${previousCode}`,
+      prompt
+        ? `Update request from the designer:\n${prompt}`
+        : 'Regenerate the component, keeping it consistent with the original design.',
+    );
+  } else if (prompt) {
+    sections.push(`Additional instructions from the designer:\n${prompt}`);
+  }
+
+  return sections.join('\n\n');
+}
+
+async function generateWithAnthropic(
+  apiKey: string,
+  model: string,
+  requestText: string,
+  imageBase64?: string,
+) {
+  const anthropic = new Anthropic({ apiKey });
+  const userContent: Anthropic.MessageParam['content'] = [
+    {
+      type: 'text',
+      text: requestText,
+    },
+  ];
+
+  if (imageBase64) {
+    userContent.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: 'image/png',
+        data: imageBase64,
+      },
+    });
+  }
+
+  const response = await anthropic.messages.create({
+    model,
+    max_tokens: 2000,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: userContent }],
+  });
+
+  const textBlock = response.content.find((block) => block.type === 'text');
+  if (!textBlock || textBlock.type !== 'text') {
+    throw new Error('No text response from Claude');
+  }
+
+  return extractCode(textBlock.text);
+}
+
+async function generateWithOpenAI(
+  apiKey: string,
+  model: string,
+  requestText: string,
+  imageBase64?: string,
+) {
+  const openai = new OpenAI({ apiKey });
+  const content: ResponseInputMessageContentList = [
+    {
+      type: 'input_text',
+      text: requestText,
+    } satisfies ResponseInputText,
+  ];
+
+  if (imageBase64) {
+    content.push({
+      type: 'input_image',
+      image_url: `data:image/png;base64,${imageBase64}`,
+      detail: 'auto',
+    } satisfies ResponseInputImage);
+  }
+
+  const response = await openai.responses.create({
+    model,
+    instructions: SYSTEM_PROMPT,
+    input: [
+      {
+        role: 'user',
+        content,
+      },
+    ],
+  });
+
+  if (!response.output_text) {
+    throw new Error('No text response from OpenAI');
+  }
+
+  return extractCode(response.output_text);
+}
+
 app.post('/generate', async (req, res) => {
   try {
     const { componentName, nodeTree, imageBase64, prompt } = req.body;
-
-    // Log out the prompt
-    console.log('Received prompt:', prompt);
 
     if (!componentName || !nodeTree) {
       return res.status(400).json({ error: 'Missing componentName or nodeTree' });
     }
 
-    const isFollowUp = conversationHistory.has(componentName);
-    const history = conversationHistory.get(componentName) ?? [];
+    const previousCode = generatedCodeByComponent.get(componentName);
+    const isFollowUp = Boolean(previousCode);
+    const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
+    const llmConfig = await resolveLlmConfig();
+    const componentCode =
+      llmConfig.provider === 'openai'
+        ? await generateWithOpenAI(llmConfig.apiKey, llmConfig.model, requestText, imageBase64)
+        : await generateWithAnthropic(llmConfig.apiKey, llmConfig.model, requestText, imageBase64);
 
-    let userContent: Anthropic.MessageParam['content'];
-
-    if (!isFollowUp) {
-      userContent = [
-        {
-          type: 'text',
-          text: [
-            `Generate a React component named "${componentName}" from this Figma node tree:`,
-            JSON.stringify(nodeTree, null, 2),
-            prompt ? `\nAdditional instructions from the designer: ${prompt}` : '',
-          ].join('\n'),
-        },
-      ];
-      if (imageBase64) {
-        userContent.push({
-          type: 'image',
-          source: { type: 'base64', media_type: 'image/png', data: imageBase64 },
-        });
-      }
-    } else {
-      userContent = [
-        {
-          type: 'text',
-          text: prompt
-            ? `Update the component based on this feedback: ${prompt}`
-            : 'Regenerate the component, keeping it consistent with the original design.',
-        },
-      ];
-    }
-
-    const messages: HistoryEntry[] = [...history, { role: 'user', content: userContent }];
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 2000,
-      system: SYSTEM_PROMPT,
-      messages,
-    });
-
-    const textBlock = response.content.find((block) => block.type === 'text');
-    if (!textBlock || textBlock.type !== 'text') {
-      throw new Error('No text response from Claude');
-    }
-
-    const componentCode = extractCode(textBlock.text);
-
-    conversationHistory.set(componentName, [
-      ...messages,
-      { role: 'assistant', content: textBlock.text },
-    ]);
-
+    generatedCodeByComponent.set(componentName, componentCode);
     await fs.writeFile(path.join(GENERATED_DIR, `${componentName}.tsx`), componentCode);
 
     const storyPath = path.join(GENERATED_DIR, `${componentName}.stories.tsx`);
     try {
       await fs.access(storyPath);
     } catch {
-      const storyCode = `import ${componentName} from './${componentName}';\n\nexport default { title: 'Generated/${componentName}', component: ${componentName} };\nexport const Default = {};\n`;
+      const storyCode = `import ${componentName} from './${componentName}'\n\nexport default { title: 'Generated/${componentName}', component: ${componentName} };\nexport const Default = {};\n`;
       await fs.writeFile(storyPath, storyCode);
     }
 
-    // Touch index.css so Tailwind's watcher invalidates the CSS module and
-    // rescans the @source glob — this triggers a CSS HMR update in Storybook.
-    const indexCssPath = path.resolve(__dirname, '../storybook-app/src/index.css');
-    let css = await fs.readFile(indexCssPath, 'utf-8');
+    let css = await fs.readFile(INDEX_CSS_PATH, 'utf-8');
     css = css.replace(/\n?\/\* _tw-trigger: \d+ \*\/\n?$/, '');
-    await fs.writeFile(indexCssPath, css.trimEnd() + `\n/* _tw-trigger: ${Date.now()} */\n`);
+    await fs.writeFile(INDEX_CSS_PATH, css.trimEnd() + `\n/* _tw-trigger: ${Date.now()} */\n`);
 
     res.json({ status: 'ok', componentName, code: componentCode, isFollowUp });
   } catch (err) {
+    if (err instanceof LlmConfigurationError) {
+      return res.status(500).json({ error: 'LLM credentials required', detail: err.message });
+    }
+
     console.error('Generation failed:', err);
     res.status(500).json({ error: 'Generation failed', detail: String(err) });
   }
 });
 
-const PORT = 4000;
-app.listen(PORT, () => console.log(`Relay server listening on :${PORT}`));
+app.get('/generate', (_req, res) => {
+  res.setHeader('Allow', 'POST');
+  res.status(405).json({
+    error: 'Method Not Allowed',
+    detail: 'Use POST /generate with a JSON body containing componentName and nodeTree.',
+  });
+});
+
+app.get('/healthz', async (_req, res) => {
+  try {
+    const llmConfig = await resolveLlmConfig();
+    res.json({ status: 'ok', provider: llmConfig.provider, model: llmConfig.model });
+  } catch (error) {
+    if (error instanceof LlmConfigurationError) {
+      return res.status(200).json({ status: 'ok', provider: null, model: null, detail: error.message });
+    }
+
+    res.status(500).json({ status: 'error', detail: String(error) });
+  }
+});
+
+const PORT = Number(process.env.PORT ?? 4000);
+app.listen(PORT, () => console.log(`Relay server listening on: ${PORT}`));

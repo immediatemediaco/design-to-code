@@ -6,10 +6,13 @@ node_modules
 *.d.ts
 *.js.map
 *.ts.map
-
+docker-compose.yaml
 
 # Local env file
-.env
+!.env
+.env.local
+relay-server/.env.local
+storybook-app/.env.local
 
 # Package management
 node_modules

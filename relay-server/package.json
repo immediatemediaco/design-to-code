@@ -1,18 +1,21 @@
 {
   "name": "relay-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "Figma-to-React relay service",
   "type": "module",
-  "main": "index.js",
+  "main": "server.ts",
   "scripts": {
-    "start": "npx tsx server.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "tsx watch server.ts",
+    "start": "tsx server.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.107.0",
+    "openai": "^5.23.1",
     "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1"
   },
   "devDependencies": {

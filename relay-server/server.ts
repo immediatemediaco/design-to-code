@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -44,6 +45,32 @@ type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
 class LlmConfigurationError extends Error {}
 class PromptConfigurationError extends Error {}
+type LlmGenerationResult = {
+  componentCode: string;
+  rawText: string;
+};
+
+function logEvent(event: string, payload: Record<string, unknown>) {
+  console.log(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event,
+      ...payload,
+    }),
+  );
+}
+
+function getImageSummary(imageBase64: string | undefined) {
+  if (!imageBase64) {
+    return { hasImage: false, imageBase64Length: 0 };
+  }
+
+  return {
+    hasImage: true,
+    imageBase64Length: imageBase64.length,
+    imageBase64Preview: imageBase64.slice(0, 64),
+  };
+}
 
 function getGeneratedComponentPaths(componentName: string) {
   if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
@@ -244,7 +271,7 @@ async function generateWithAnthropic(
   systemPrompt: string,
   requestText: string,
   imageBase64?: string,
-) {
+): Promise<LlmGenerationResult> {
   const anthropic = new Anthropic({ apiKey });
   const userContent: Anthropic.MessageParam['content'] = [
     {
@@ -276,7 +303,10 @@ async function generateWithAnthropic(
     throw new Error('No text response from Claude');
   }
 
-  return extractCode(textBlock.text);
+  return {
+    rawText: textBlock.text,
+    componentCode: extractCode(textBlock.text),
+  };
 }
 
 async function generateWithOpenAI(
@@ -285,7 +315,7 @@ async function generateWithOpenAI(
   systemPrompt: string,
   requestText: string,
   imageBase64?: string,
-) {
+): Promise<LlmGenerationResult> {
   const openai = new OpenAI({ apiKey });
   const content: ResponseInputMessageContentList = [
     {
@@ -317,14 +347,25 @@ async function generateWithOpenAI(
     throw new Error('No text response from OpenAI');
   }
 
-  return extractCode(response.output_text);
+  return {
+    rawText: response.output_text,
+    componentCode: extractCode(response.output_text),
+  };
 }
 
 app.post('/generate', async (req, res) => {
+  const requestId = randomUUID();
+
   try {
     const { nodeId, componentName, nodeTree, imageBase64, prompt } = req.body;
 
     if (!componentName || !nodeTree) {
+      logEvent('generate.inbound.invalid', {
+        requestId,
+        componentName,
+        nodeId,
+      });
+
       return res.status(400).json({ error: 'Missing componentName or nodeTree' });
     }
 
@@ -335,7 +376,30 @@ app.post('/generate', async (req, res) => {
     const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
     const systemPrompt = await getSystemPrompt();
     const llmConfig = await resolveLlmConfig();
-    const componentCode =
+    const imageSummary = getImageSummary(imageBase64);
+
+    logEvent('generate.inbound.request', {
+      requestId,
+      nodeId,
+      componentName,
+      generationKey,
+      prompt: prompt ?? '',
+      nodeTree,
+      previousCode,
+      isFollowUp,
+      ...imageSummary,
+    });
+
+    logEvent('generate.outbound.llm_request', {
+      requestId,
+      provider: llmConfig.provider,
+      model: llmConfig.model,
+      systemPrompt,
+      requestText,
+      ...imageSummary,
+    });
+
+    const llmResult =
       llmConfig.provider === 'openai'
         ? await generateWithOpenAI(
             llmConfig.apiKey,
@@ -352,6 +416,15 @@ app.post('/generate', async (req, res) => {
             imageBase64,
           );
 
+    logEvent('generate.inbound.llm_response', {
+      requestId,
+      provider: llmConfig.provider,
+      model: llmConfig.model,
+      rawText: llmResult.rawText,
+      componentCode: llmResult.componentCode,
+    });
+
+    const componentCode = llmResult.componentCode;
     generatedCodeByKey.set(generationKey, componentCode);
     const { componentDir, componentPath, storyPath } = getGeneratedComponentPaths(componentName);
     await fs.mkdir(componentDir, { recursive: true });
@@ -365,17 +438,39 @@ app.post('/generate', async (req, res) => {
 
     await touchReloadFile();
 
-    res.json({ status: 'ok', componentName, code: componentCode, isFollowUp });
+    const responseBody = { status: 'ok', componentName, code: componentCode, isFollowUp };
+    logEvent('generate.outbound.response', {
+      requestId,
+      responseBody,
+      componentPath,
+      storyPath,
+    });
+    res.json(responseBody);
   } catch (err) {
     if (err instanceof LlmConfigurationError) {
+      logEvent('generate.outbound.error', {
+        requestId,
+        error: 'LLM credentials required',
+        detail: err.message,
+      });
       return res.status(500).json({ error: 'LLM credentials required', detail: err.message });
     }
 
     if (err instanceof PromptConfigurationError) {
+      logEvent('generate.outbound.error', {
+        requestId,
+        error: 'Prompt configuration invalid',
+        detail: err.message,
+      });
       return res.status(500).json({ error: 'Prompt configuration invalid', detail: err.message });
     }
 
     console.error('Generation failed:', err);
+    logEvent('generate.outbound.error', {
+      requestId,
+      error: 'Generation failed',
+      detail: String(err),
+    });
     res.status(500).json({ error: 'Generation failed', detail: String(err) });
   }
 });

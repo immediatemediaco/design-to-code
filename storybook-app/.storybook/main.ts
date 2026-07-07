@@ -17,6 +17,11 @@ const config: StorybookConfig = {
         dedupe: ['react', 'react-dom'],
       },
       server: {
+        // Vite's own dev-server CORS check runs in front of the /generate proxy target
+        // and only allows *.localhost/127.0.0.1 origins by default. The Figma plugin UI
+        // runs in a sandboxed iframe with Origin: null, which fails that check, so the
+        // preflight gets rejected before it ever reaches the relay's own CORS handling.
+        cors: true,
         proxy: {
           '/generate': {
             target: process.env.STORYBOOK_RELAY_TARGET ?? 'http://localhost:4000',

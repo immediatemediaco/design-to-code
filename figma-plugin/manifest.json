@@ -4,9 +4,15 @@
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
-  "editorType": ["figma"],
+  "editorType": [
+    "figma"
+  ],
   "networkAccess": {
-    "allowedDomains": ["none"],
-    "devAllowedDomains": ["http://localhost:8516"]
+    "allowedDomains": [
+      "none"
+    ],
+    "devAllowedDomains": [
+      "https://design-to-code.localhost"
+    ]
   }
 }

@@ -24,19 +24,9 @@ const GENERATED_DIR = path.resolve(
 const INDEX_CSS_PATH = path.resolve(
   process.env.STORYBOOK_INDEX_CSS_PATH ?? path.resolve(__dirname, '../storybook-app/src/index.css'),
 );
-
-const SYSTEM_PROMPT = `You generate a single React functional component in TypeScript (TSX) from a Figma design description.
-
-Rules:
-- Output ONLY the component code, no explanation, no markdown fences.
-- Use Tailwind utility classes for ALL styling. No inline styles, no CSS files.
-- Export a single default function component.
-- Name the component exactly as given in the prompt.
-- Use semantic HTML elements where appropriate.
-- Map Figma auto-layout frames to flex containers (flex-row or flex-col, gap-*, p-*).
-- Map Figma fills to Tailwind background/text color classes, approximating to the nearest Tailwind color if an exact hex isn't available.
-- Do not invent props or external dependencies. No imports beyond React itself.
-- When the user provides additional instructions, prioritise satisfying them while keeping the component visually close to the original design.`;
+const PROMPTS_DIR = path.resolve(process.env.PROMPTS_DIR ?? path.resolve(__dirname, '../prompts'));
+const PROMPT_GUARDS_DIR = 'guards';
+const SYSTEM_PROMPT_ENTRYPOINT = process.env.SYSTEM_PROMPT_FILE ?? 'import.md';
 
 const DEFAULT_MODEL_BY_PROVIDER = {
   anthropic: 'claude-sonnet-4-6',
@@ -47,10 +37,90 @@ const generatedCodeByKey = new Map<string, string>();
 type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
 class LlmConfigurationError extends Error {}
+class PromptConfigurationError extends Error {}
 
 function extractCode(responseText: string): string {
   const fenceMatch = responseText.match(/```(?:tsx|jsx|ts|js)?\n([\s\S]*?)```/);
   return fenceMatch ? (fenceMatch[1] ?? '').trim() : responseText.trim();
+}
+
+async function loadPromptFile(relativePath: string, seen = new Set<string>()): Promise<string> {
+  const normalizedPath = path.posix.normalize(relativePath);
+
+  if (normalizedPath.startsWith('..')) {
+    throw new PromptConfigurationError(`Prompt import escapes the prompts directory: ${relativePath}`);
+  }
+
+  if (seen.has(normalizedPath)) {
+    throw new PromptConfigurationError(`Circular prompt import detected for ${normalizedPath}`);
+  }
+
+  seen.add(normalizedPath);
+
+  const filePath = path.join(PROMPTS_DIR, normalizedPath);
+  const rawPrompt = await fs.readFile(filePath, 'utf-8');
+  const lines = rawPrompt.split('\n');
+  const resolvedLines: string[] = [];
+
+  for (const line of lines) {
+    const importMatch = line.match(/^@import\s+(.+)$/);
+
+    if (!importMatch) {
+      resolvedLines.push(line);
+      continue;
+    }
+
+    const importedPrompt = await loadPromptFile(importMatch[1]!.trim(), new Set(seen));
+    resolvedLines.push(importedPrompt);
+  }
+
+  return resolvedLines.join('\n').trim();
+}
+
+function isGuardPromptPath(relativePath: string) {
+  return relativePath === PROMPT_GUARDS_DIR || relativePath.startsWith(`${PROMPT_GUARDS_DIR}/`);
+}
+
+async function listGuardPromptFiles() {
+  const guardsDirPath = path.join(PROMPTS_DIR, PROMPT_GUARDS_DIR);
+
+  try {
+    const entries = await fs.readdir(guardsDirPath, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+      .map((entry) => path.posix.join(PROMPT_GUARDS_DIR, entry.name))
+      .sort();
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+      return [];
+    }
+
+    throw error;
+  }
+}
+
+async function getPromptContent(relativePath: string) {
+  const promptBody = await loadPromptFile(relativePath);
+
+  if (isGuardPromptPath(relativePath)) {
+    return promptBody;
+  }
+
+  const guardFiles = await listGuardPromptFiles();
+  const guardContent = await Promise.all(guardFiles.map((guardFile) => loadPromptFile(guardFile)));
+  return [...guardContent, promptBody].filter(Boolean).join('\n\n').trim();
+}
+
+async function getSystemPrompt() {
+  try {
+    return await getPromptContent(SYSTEM_PROMPT_ENTRYPOINT);
+  } catch (error) {
+    if (error instanceof PromptConfigurationError) {
+      throw error;
+    }
+
+    throw new PromptConfigurationError(`Unable to load prompts from ${PROMPTS_DIR}`);
+  }
 }
 
 function getConfiguredModel(provider: LlmProvider) {
@@ -171,6 +241,7 @@ function buildGenerationPrompt(
 async function generateWithAnthropic(
   apiKey: string,
   model: string,
+  systemPrompt: string,
   requestText: string,
   imageBase64?: string,
 ) {
@@ -196,7 +267,7 @@ async function generateWithAnthropic(
   const response = await anthropic.messages.create({
     model,
     max_tokens: 2000,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt,
     messages: [{ role: 'user', content: userContent }],
   });
 
@@ -211,6 +282,7 @@ async function generateWithAnthropic(
 async function generateWithOpenAI(
   apiKey: string,
   model: string,
+  systemPrompt: string,
   requestText: string,
   imageBase64?: string,
 ) {
@@ -232,7 +304,7 @@ async function generateWithOpenAI(
 
   const response = await openai.responses.create({
     model,
-    instructions: SYSTEM_PROMPT,
+    instructions: systemPrompt,
     input: [
       {
         role: 'user',
@@ -261,11 +333,24 @@ app.post('/generate', async (req, res) => {
     const previousCode = generatedCodeByKey.get(generationKey);
     const isFollowUp = Boolean(previousCode);
     const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
+    const systemPrompt = await getSystemPrompt();
     const llmConfig = await resolveLlmConfig();
     const componentCode =
       llmConfig.provider === 'openai'
-        ? await generateWithOpenAI(llmConfig.apiKey, llmConfig.model, requestText, imageBase64)
-        : await generateWithAnthropic(llmConfig.apiKey, llmConfig.model, requestText, imageBase64);
+        ? await generateWithOpenAI(
+            llmConfig.apiKey,
+            llmConfig.model,
+            systemPrompt,
+            requestText,
+            imageBase64,
+          )
+        : await generateWithAnthropic(
+            llmConfig.apiKey,
+            llmConfig.model,
+            systemPrompt,
+            requestText,
+            imageBase64,
+          );
 
     generatedCodeByKey.set(generationKey, componentCode);
     await fs.writeFile(path.join(GENERATED_DIR, `${componentName}.tsx`), componentCode);
@@ -288,6 +373,10 @@ app.post('/generate', async (req, res) => {
       return res.status(500).json({ error: 'LLM credentials required', detail: err.message });
     }
 
+    if (err instanceof PromptConfigurationError) {
+      return res.status(500).json({ error: 'Prompt configuration invalid', detail: err.message });
+    }
+
     console.error('Generation failed:', err);
     res.status(500).json({ error: 'Generation failed', detail: String(err) });
   }
@@ -303,11 +392,16 @@ app.get('/generate', (_req, res) => {
 
 app.get('/healthz', async (_req, res) => {
   try {
+    await getSystemPrompt();
     const llmConfig = await resolveLlmConfig();
     res.json({ status: 'ok', provider: llmConfig.provider, model: llmConfig.model });
   } catch (error) {
     if (error instanceof LlmConfigurationError) {
       return res.status(200).json({ status: 'ok', provider: null, model: null, detail: error.message });
+    }
+
+    if (error instanceof PromptConfigurationError) {
+      return res.status(500).json({ status: 'error', detail: error.message });
     }
 
     res.status(500).json({ status: 'error', detail: String(error) });

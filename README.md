@@ -14,6 +14,7 @@ A proof-of-concept pipeline that turns a Figma design into a live React componen
 ```text
 design-to-code/
 ├── figma-plugin/            # Figma plugin for capture + follow-up prompts
+├── prompts/                 # Markdown prompt files loaded by the relay
 ├── docker/                 # Container build definitions
 ├── relay-server/           # Express relay that calls Claude/OpenAI and writes generated files
 ├── scripts/                # Local orchestration helpers
@@ -117,6 +118,7 @@ yarn plugin:build
 
 - `relay-server` now runs in Docker and writes into the bind-mounted `storybook-app` source tree.
 - `relay-server` uses application-defined model defaults: Claude first when `ANTHROPIC_API_KEY` exists, then OpenAI/Codex via `OPENAI_API_KEY`, then an optional mounted Codex auth file when `~/.codex/auth.json` exists locally.
+- prompt text now lives under `prompts/`, and every non-guard prompt automatically inherits all markdown files in `prompts/guards/`
 - Storybook proxies `/generate` and `/healthz` to the internal relay container in dev, so browser traffic can stay on the same proxied hostname.
 - `docker-compose-generator.sh` mirrors the command shape used in the pipeline dashboard repos.
 - The Figma plugin uses the direct forwarded nginx port in development so it does not need to trust the local TLS certificate used by `*.localhost`.

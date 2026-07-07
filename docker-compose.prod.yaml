@@ -1,0 +1,11 @@
+---
+services:
+  app:
+    image: ${APP_NAME:-design-to-code}-app-prod:local
+    build:
+      target: app
+
+  relay:
+    image: ${APP_NAME:-design-to-code}-relay-prod:local
+    build:
+      target: relay

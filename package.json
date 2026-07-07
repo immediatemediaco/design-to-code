@@ -1,8 +1,24 @@
 {
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.107.0"
+  "name": "design-to-code",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Root orchestration package for the design-to-code docker stack",
+  "scripts": {
+    "setup": "npm run util:install && npm run util:build-env:local && npm run start",
+    "start": "npm run stop && npm run start:dev",
+    "stop": "if [ -f docker-compose.yaml ]; then docker compose down --remove-orphans --volumes; fi && docker network prune -f",
+    "compose:build": "docker compose --env-file .env --env-file .env.local build app relay nginx cache && docker compose --env-file .env --env-file .env.local build",
+    "compose:up": "docker compose --env-file .env --env-file .env.local up -d --build --remove-orphans --force-recreate",
+    "start:dev": "npm run start:reverse-proxy && ./docker-compose-generator.sh && npm run compose:build && npm run compose:up && npm run util:is-ready",
+    "start:prod": "npm run start:reverse-proxy && ./docker-compose-generator.sh --prod && npm run compose:build && npm run compose:up && npm run util:is-ready",
+    "start:reverse-proxy": "start-reverse-proxy",
+    "logs": "docker compose logs -f app relay nginx cache",
+    "util:install": "npm install",
+    "util:build-env:local": "touch .env.local && touch relay-server/.env.local && touch storybook-app/.env.local",
+    "util:is-ready": "node ./scripts/wait-for-url.mjs https://${APP_NAME:-design-to-code}.localhost/healthz"
   },
-  "devDependencies": {
-    "dotenv": "^17.4.2"
+  "dependencies": {
+    "@immediate_media/docker-templates": "^5.5.0",
+    "@immediate_media/local-reverse-proxy-orchestrator": "^1.3.1"
   }
 }

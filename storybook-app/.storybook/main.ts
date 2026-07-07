@@ -1,5 +1,10 @@
 import type { StorybookConfig } from '@storybook/react-vite';
 import { mergeConfig } from 'vite';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const patchworkRoot = process.env.PATCHWORK_ROOT?.trim();
+const storybookAppRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const config: StorybookConfig = {
   stories: ['../src/**/*.mdx', '../src/**/*.stories.@(js|jsx|mjs|ts|tsx)'],
@@ -14,6 +19,11 @@ const config: StorybookConfig = {
   async viteFinal(config) {
     return mergeConfig(config, {
       resolve: {
+        alias: patchworkRoot
+          ? {
+              '@patchwork': patchworkRoot,
+            }
+          : undefined,
         dedupe: ['react', 'react-dom'],
       },
       server: {
@@ -22,6 +32,9 @@ const config: StorybookConfig = {
         // runs in a sandboxed iframe with Origin: null, which fails that check, so the
         // preflight gets rejected before it ever reaches the relay's own CORS handling.
         cors: true,
+        fs: {
+          allow: [storybookAppRoot, patchworkRoot].filter(Boolean),
+        },
         proxy: {
           '/generate': {
             target: process.env.STORYBOOK_RELAY_TARGET ?? 'http://localhost:4000',

@@ -1,5 +1,0 @@
----
-services:
-  relay:
-    volumes:
-      - ~/.codex:/root/.codex:ro

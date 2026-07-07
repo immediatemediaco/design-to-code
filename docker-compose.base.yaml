@@ -12,8 +12,8 @@ services:
       - ${ENV_FILE:-.env}
     environment:
       PORT: 9000
+      STORYBOOK_PORT: 9001
       RELAY_TARGET: ${RELAY_TARGET:-http://relay:4000}
-      STORYBOOK_RELAY_TARGET: ${STORYBOOK_RELAY_TARGET:-http://relay:4000}
     depends_on:
       - relay
     extra_hosts:
@@ -27,8 +27,7 @@ services:
       - ${ENV_FILE:-.env}
     environment:
       PORT: 4000
-      GENERATED_DIR: /workspace/storybook-app/src/components/Generated
-      STORYBOOK_INDEX_CSS_PATH: /workspace/storybook-app/src/index.css
-      CODEX_AUTH_PATH: /root/.codex/auth.json
+      GENERATED_DIR: /workspace/patchwork/packages/components/src/generated
+      GENERATED_COMPONENT_FORMAT: patchwork
     extra_hosts:
       - "host.docker.internal:host-gateway"

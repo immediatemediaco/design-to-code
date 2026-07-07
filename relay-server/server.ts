@@ -35,19 +35,20 @@ Rules:
 - Use semantic HTML elements where appropriate.
 - Map Figma auto-layout frames to flex containers (flex-row or flex-col, gap-*, p-*).
 - Map Figma fills to Tailwind background/text color classes, approximating to the nearest Tailwind color if an exact hex isn't available.
-- Do not invent props or external dependencies. No imports beyond React itself.`;
+- Do not invent props or external dependencies. No imports beyond React itself.
+- When the user provides additional instructions, prioritise satisfying them while keeping the component visually close to the original design.`;
 
 const DEFAULT_MODEL_BY_PROVIDER = {
   anthropic: 'claude-sonnet-4-6',
   openai: 'gpt-5-codex',
 } as const;
 const CODEX_AUTH_PATH = process.env.CODEX_AUTH_PATH ?? path.join(process.env.HOME ?? '/root', '.codex/auth.json');
+const generatedCodeByKey = new Map<string, string>();
 type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
 class LlmConfigurationError extends Error {}
 
 function extractCode(responseText: string): string {
-  // Strip markdown fences if the model adds them despite instructions
   const fenceMatch = responseText.match(/```(?:tsx|jsx|ts|js)?\n([\s\S]*?)```/);
   return fenceMatch ? (fenceMatch[1] ?? '').trim() : responseText.trim();
 }
@@ -142,18 +143,42 @@ async function resolveLlmConfig() {
   );
 }
 
+function buildGenerationPrompt(
+  componentName: string,
+  nodeTree: unknown,
+  prompt: string | undefined,
+  previousCode: string | undefined,
+) {
+  const sections = [
+    `Generate a React component named "${componentName}".`,
+    `Figma node tree:\n${JSON.stringify(nodeTree, null, 2)}`,
+  ];
+
+  if (previousCode) {
+    sections.push(
+      `Current implementation to update:\n${previousCode}`,
+      prompt
+        ? `Update request from the designer:\n${prompt}`
+        : 'Regenerate the component, keeping it consistent with the original design.',
+    );
+  } else if (prompt) {
+    sections.push(`Additional instructions from the designer:\n${prompt}`);
+  }
+
+  return sections.join('\n\n');
+}
+
 async function generateWithAnthropic(
   apiKey: string,
   model: string,
-  componentName: string,
-  nodeTree: unknown,
+  requestText: string,
   imageBase64?: string,
 ) {
   const anthropic = new Anthropic({ apiKey });
   const userContent: Anthropic.MessageParam['content'] = [
     {
       type: 'text',
-      text: `Generate a React component named "${componentName}" from this Figma node tree:\n\n${JSON.stringify(nodeTree, null, 2)}`,
+      text: requestText,
     },
   ];
 
@@ -186,15 +211,14 @@ async function generateWithAnthropic(
 async function generateWithOpenAI(
   apiKey: string,
   model: string,
-  componentName: string,
-  nodeTree: unknown,
+  requestText: string,
   imageBase64?: string,
 ) {
   const openai = new OpenAI({ apiKey });
   const content: ResponseInputMessageContentList = [
     {
       type: 'input_text',
-      text: `Generate a React component named "${componentName}" from this Figma node tree:\n\n${JSON.stringify(nodeTree, null, 2)}`,
+      text: requestText,
     } satisfies ResponseInputText,
   ];
 
@@ -226,30 +250,24 @@ async function generateWithOpenAI(
 
 app.post('/generate', async (req, res) => {
   try {
-    const { componentName, nodeTree, imageBase64 } = req.body;
+    const { nodeId, componentName, nodeTree, imageBase64, prompt } = req.body;
 
     if (!componentName || !nodeTree) {
       return res.status(400).json({ error: 'Missing componentName or nodeTree' });
     }
 
+    const generationKey =
+      typeof nodeId === 'string' && nodeId.trim().length > 0 ? nodeId.trim() : componentName;
+    const previousCode = generatedCodeByKey.get(generationKey);
+    const isFollowUp = Boolean(previousCode);
+    const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
     const llmConfig = await resolveLlmConfig();
     const componentCode =
       llmConfig.provider === 'openai'
-        ? await generateWithOpenAI(
-            llmConfig.apiKey,
-            llmConfig.model,
-            componentName,
-            nodeTree,
-            imageBase64,
-          )
-        : await generateWithAnthropic(
-            llmConfig.apiKey,
-            llmConfig.model,
-            componentName,
-            nodeTree,
-            imageBase64,
-          );
+        ? await generateWithOpenAI(llmConfig.apiKey, llmConfig.model, requestText, imageBase64)
+        : await generateWithAnthropic(llmConfig.apiKey, llmConfig.model, requestText, imageBase64);
 
+    generatedCodeByKey.set(generationKey, componentCode);
     await fs.writeFile(path.join(GENERATED_DIR, `${componentName}.tsx`), componentCode);
 
     const storyPath = path.join(GENERATED_DIR, `${componentName}.stories.tsx`);
@@ -260,13 +278,11 @@ app.post('/generate', async (req, res) => {
       await fs.writeFile(storyPath, storyCode);
     }
 
-    // Touch index.css so Tailwind's watcher invalidates the CSS module and
-    // rescans the @source glob — this triggers a CSS HMR update in Storybook.
     let css = await fs.readFile(INDEX_CSS_PATH, 'utf-8');
     css = css.replace(/\n?\/\* _tw-trigger: \d+ \*\/\n?$/, '');
     await fs.writeFile(INDEX_CSS_PATH, css.trimEnd() + `\n/* _tw-trigger: ${Date.now()} */\n`);
 
-    res.json({ status: 'ok', componentName, code: componentCode });
+    res.json({ status: 'ok', componentName, code: componentCode, isFollowUp });
   } catch (err) {
     if (err instanceof LlmConfigurationError) {
       return res.status(500).json({ error: 'LLM credentials required', detail: err.message });

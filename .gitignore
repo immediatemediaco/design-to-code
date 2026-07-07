@@ -1,7 +1,11 @@
+.DS_Store
 node_modules
 
 # Build
 /dist/**/*
+*.d.ts
+*.js.map
+*.ts.map
 docker-compose.yaml
 
 # Local env file

@@ -128,6 +128,11 @@ function proxyHttpRequest(target, request, response) {
   request.pipe(upstreamRequest);
 }
 
+function isRelayRoute(requestUrl) {
+  const pathname = new URL(requestUrl ?? '/', 'http://localhost').pathname;
+  return pathname === '/generate' || pathname === '/healthz';
+}
+
 function shouldServeSpaFallback(requestPath) {
   return path.extname(requestPath) === '';
 }
@@ -157,7 +162,7 @@ async function serveStatic(request, response) {
 
 const server = http.createServer(async (request, response) => {
   try {
-    if (request.url?.startsWith('/generate') || request.url?.startsWith('/healthz')) {
+    if (isRelayRoute(request.url)) {
       proxyHttpRequest(relayTarget, request, response);
       return;
     }

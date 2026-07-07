@@ -115,8 +115,13 @@ function proxyHttpRequest(target, request, response) {
   request.pipe(upstreamRequest);
 }
 
+function isRelayRoute(requestUrl) {
+  const pathname = new URL(requestUrl ?? '/', 'http://localhost').pathname;
+  return pathname === '/generate' || pathname === '/healthz';
+}
+
 const server = http.createServer((request, response) => {
-  if (request.url?.startsWith('/generate') || request.url?.startsWith('/healthz')) {
+  if (isRelayRoute(request.url)) {
     proxyHttpRequest(relayTarget, request, response);
     return;
   }

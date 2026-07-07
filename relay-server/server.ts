@@ -277,6 +277,14 @@ app.post('/generate', async (req, res) => {
   }
 });
 
+app.get('/generate', (_req, res) => {
+  res.setHeader('Allow', 'POST');
+  res.status(405).json({
+    error: 'Method Not Allowed',
+    detail: 'Use POST /generate with a JSON body containing componentName and nodeTree.',
+  });
+});
+
 app.get('/healthz', async (_req, res) => {
   try {
     const llmConfig = await resolveLlmConfig();

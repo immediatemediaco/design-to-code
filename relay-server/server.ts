@@ -25,6 +25,7 @@ const INDEX_CSS_PATH = path.resolve(
   process.env.STORYBOOK_INDEX_CSS_PATH ?? path.resolve(__dirname, '../storybook-app/src/index.css'),
 );
 const PROMPTS_DIR = path.resolve(process.env.PROMPTS_DIR ?? path.resolve(__dirname, '../prompts'));
+const PROMPT_FACTS_DIR = 'facts';
 const PROMPT_GUARDS_DIR = 'guards';
 const SYSTEM_PROMPT_ENTRYPOINT = process.env.SYSTEM_PROMPT_FILE ?? 'import.md';
 
@@ -81,14 +82,18 @@ function isGuardPromptPath(relativePath: string) {
   return relativePath === PROMPT_GUARDS_DIR || relativePath.startsWith(`${PROMPT_GUARDS_DIR}/`);
 }
 
-async function listGuardPromptFiles() {
-  const guardsDirPath = path.join(PROMPTS_DIR, PROMPT_GUARDS_DIR);
+function isFactPromptPath(relativePath: string) {
+  return relativePath === PROMPT_FACTS_DIR || relativePath.startsWith(`${PROMPT_FACTS_DIR}/`);
+}
+
+async function listPromptFilesInDirectory(directory: string) {
+  const directoryPath = path.join(PROMPTS_DIR, directory);
 
   try {
-    const entries = await fs.readdir(guardsDirPath, { withFileTypes: true });
+    const entries = await fs.readdir(directoryPath, { withFileTypes: true });
     return entries
       .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
-      .map((entry) => path.posix.join(PROMPT_GUARDS_DIR, entry.name))
+      .map((entry) => path.posix.join(directory, entry.name))
       .sort();
   } catch (error) {
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
@@ -102,13 +107,15 @@ async function listGuardPromptFiles() {
 async function getPromptContent(relativePath: string) {
   const promptBody = await loadPromptFile(relativePath);
 
-  if (isGuardPromptPath(relativePath)) {
+  if (isGuardPromptPath(relativePath) || isFactPromptPath(relativePath)) {
     return promptBody;
   }
 
-  const guardFiles = await listGuardPromptFiles();
+  const factFiles = await listPromptFilesInDirectory(PROMPT_FACTS_DIR);
+  const factContent = await Promise.all(factFiles.map((factFile) => loadPromptFile(factFile)));
+  const guardFiles = await listPromptFilesInDirectory(PROMPT_GUARDS_DIR);
   const guardContent = await Promise.all(guardFiles.map((guardFile) => loadPromptFile(guardFile)));
-  return [...guardContent, promptBody].filter(Boolean).join('\n\n').trim();
+  return [...factContent, ...guardContent, promptBody].filter(Boolean).join('\n\n').trim();
 }
 
 async function getSystemPrompt() {

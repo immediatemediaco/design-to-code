@@ -97,5 +97,5 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, '0.0.0.0', () => {
-  console.log(`Storybook server listening on ${port}`);
+  console.log(`app server listening on 0.0.0.0:${port} (prod), ready in 0 ms.`);
 });

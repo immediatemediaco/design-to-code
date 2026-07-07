@@ -5,7 +5,7 @@ A proof-of-concept pipeline that turns a Figma design into a live React componen
 ## How it works
 
 1. The **relay server** receives a `POST /generate` request containing a Figma node tree, component name, and optional screenshot.
-2. It sends the design data to **Claude** and generates a Tailwind-styled React component.
+2. It sends the design data to the first available LLM provider and generates a Tailwind-styled React component.
 3. The component and story are written into `storybook-app/src/components/Generated/`.
 4. Storybook reloads through the shared Docker stack, served behind the local localhost proxy.
 
@@ -23,16 +23,24 @@ design-to-code/
 
 - Docker Desktop
 - npm
-- Anthropic API key
+- Anthropic API key, OpenAI API key, or a local Codex auth file
 - The local reverse proxy used by the pipeline dashboard repos
 
 ## Running locally
 
-Set your Anthropic key in `.env.local`:
+Set credentials in `.env.local` if you want to provide them explicitly:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+Credential precedence is:
+
+1. `ANTHROPIC_API_KEY`
+2. `OPENAI_API_KEY`
+3. `~/.codex/auth.json` mounted into the relay container at `/root/.codex/auth.json` when that file exists locally
+
+If none are available, `/generate` returns an `LLM credentials required` error.
 
 Then use the root orchestration commands:
 
@@ -51,6 +59,7 @@ That will:
 1. Ensure the local reverse proxy is running.
 2. Generate `docker-compose.yaml` from the same template-driven pattern as the pipeline dashboard repos.
 3. Build and start the Storybook app, nginx frontend, cache layer, and relay server in Docker.
+4. Wait for the app container to report ready before returning control.
 
 Primary URLs:
 
@@ -84,6 +93,7 @@ Generated components appear under the **Generated** section in Storybook. Storie
 ## Notes
 
 - `relay-server` now runs in Docker and writes into the bind-mounted `storybook-app` source tree.
+- `relay-server` uses application-defined model defaults: Claude first when `ANTHROPIC_API_KEY` exists, then OpenAI/Codex via `OPENAI_API_KEY`, then an optional mounted Codex auth file when `~/.codex/auth.json` exists locally.
 - Storybook proxies `/generate` to the internal relay container in dev, so browser traffic can stay on the same proxied hostname.
 - `docker-compose-generator.sh` mirrors the command shape used in the pipeline dashboard repos.
 

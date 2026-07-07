@@ -29,5 +29,6 @@ services:
       PORT: 4000
       GENERATED_DIR: /workspace/storybook-app/src/components/Generated
       STORYBOOK_INDEX_CSS_PATH: /workspace/storybook-app/src/index.css
+      CODEX_AUTH_PATH: /root/.codex/auth.json
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -13,6 +13,7 @@ docker-compose.yaml
 .env.local
 relay-server/.env.local
 storybook-app/.env.local
+patchwork/
 
 # Package management
 node_modules

@@ -10,6 +10,7 @@ RUN npm ci
 FROM deps AS workspace
 
 COPY relay-server ./
+COPY prompts /workspace/prompts
 
 FROM workspace AS relay_dev
 

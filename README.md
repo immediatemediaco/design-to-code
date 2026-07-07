@@ -1,12 +1,12 @@
 # design-to-code
 
-A proof-of-concept pipeline that turns a Figma design into a live React component, instantly visible in Storybook without a page reload.
+A proof-of-concept pipeline that turns a Figma design into a live React component in Patchwork, instantly visible in Storybook without a page reload.
 
 ## How it works
 
 1. A **Figma plugin** or any other client sends a `POST /generate` request containing a component name, Figma node tree, optional screenshot, and optional free-text prompt.
 2. The **relay server** sends the design data to the first available LLM provider and generates or updates a Tailwind-styled React component.
-3. The component and story are written into `storybook-app/src/components/Generated/`.
+3. The component and story are written into `patchwork/packages/components/src/generated/`.
 4. Storybook reloads through the shared Docker stack, served behind the local localhost proxy.
 
 ## Project structure
@@ -14,18 +14,19 @@ A proof-of-concept pipeline that turns a Figma design into a live React componen
 ```text
 design-to-code/
 ├── figma-plugin/            # Figma plugin for capture + follow-up prompts
+├── patchwork/               # Local Patchwork checkout used as the real generation target
 ├── prompts/                 # Markdown prompt files loaded by the relay
 ├── docker/                 # Container build definitions
 ├── relay-server/           # Express relay that calls Claude/OpenAI and writes generated files
 ├── scripts/                # Local orchestration helpers
-└── storybook-app/          # Storybook host app for live component preview
+└── storybook-app/          # Legacy local example app kept in-repo, but not used by the Docker stack
 ```
 
 ## Prerequisites
 
 - Docker Desktop
 - Yarn
-- Anthropic API key, OpenAI API key, or a local Codex auth file
+- Anthropic API key or OpenAI API key
 - The local reverse proxy used by the pipeline dashboard repos
 
 ## Running locally
@@ -40,7 +41,6 @@ Credential precedence is:
 
 1. `ANTHROPIC_API_KEY`
 2. `OPENAI_API_KEY`
-3. `~/.codex/auth.json` mounted into the relay container at `/root/.codex/auth.json` when that file exists locally
 
 If none are available, `/generate` returns an `LLM credentials required` error.
 
@@ -56,11 +56,13 @@ For day-to-day use after the first install:
 yarn start
 ```
 
+`yarn setup` bootstraps a local Patchwork checkout into `./patchwork` when it is missing. `yarn start` also re-checks that dependency before bringing the stack up. The Docker stack mounts Patchwork into both containers at `/workspace/patchwork` and runs the app service as a thin proxy in front of Patchwork Storybook.
+
 That will:
 
 1. Ensure the local reverse proxy is running.
 2. Generate `docker-compose.yaml` from the same template-driven pattern as the pipeline dashboard repos.
-3. Build and start the Storybook app, nginx frontend, cache layer, and relay server in Docker.
+3. Build and start the Patchwork Storybook wrapper, nginx frontend, cache layer, and relay server in Docker.
 4. Wait for the app container to report ready before returning control.
 
 Primary URLs:
@@ -90,7 +92,7 @@ curl -k -X POST https://design-to-code.localhost/generate \
 
 The response includes `{ status, componentName, code }`.
 
-Generated components appear under the **Generated** section in Storybook. Stories are only created on first generation; later requests update the component file without overwriting the story.
+Generated components appear under the **Generated** section in Patchwork Storybook. Stories are only created on first generation; later requests update the component file without overwriting the story.
 
 If you send another request for the same `componentName`, the relay treats it as a follow-up and includes the last generated component code in the prompt so the model can refine the existing result instead of starting from scratch.
 
@@ -116,9 +118,11 @@ yarn plugin:build
 
 ## Notes
 
-- `relay-server` now runs in Docker and writes into the bind-mounted `storybook-app` source tree.
-- `relay-server` uses application-defined model defaults: Claude first when `ANTHROPIC_API_KEY` exists, then OpenAI/Codex via `OPENAI_API_KEY`, then an optional mounted Codex auth file when `~/.codex/auth.json` exists locally.
+- `relay-server` runs in Docker and writes into the bind-mounted Patchwork source tree by default.
+- Patchwork is a first-class local dependency for this repo and is expected at `./patchwork`.
+- The default Patchwork clone source is `git@github.immediate.co.uk:wcp-packages/patchwork.git`, and you can override it with `PATCHWORK_REPO` during install if needed.
+- `relay-server` uses application-defined model defaults: Claude first when `ANTHROPIC_API_KEY` exists, then OpenAI via `OPENAI_API_KEY`.
 - prompt text now lives under `prompts/`, and every non-guard prompt automatically inherits all markdown files in `prompts/guards/`
-- Storybook proxies `/generate` and `/healthz` to the internal relay container in dev, so browser traffic can stay on the same proxied hostname.
+- The app wrapper proxies `/generate` and `/healthz` to the internal relay container in dev, so browser traffic can stay on the same proxied hostname while the rest of the traffic goes to Patchwork Storybook.
 - `docker-compose-generator.sh` mirrors the command shape used in the pipeline dashboard repos.
 - The Figma plugin uses the direct forwarded nginx port in development so it does not need to trust the local TLS certificate used by `*.localhost`.

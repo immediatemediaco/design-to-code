@@ -18,12 +18,18 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+const GENERATED_COMPONENT_FORMAT = process.env.GENERATED_COMPONENT_FORMAT ?? 'sandbox';
 const GENERATED_DIR = path.resolve(
-  process.env.GENERATED_DIR ?? path.resolve(__dirname, '../storybook-app/src/components/Generated'),
+  process.env.GENERATED_DIR ??
+    (GENERATED_COMPONENT_FORMAT === 'patchwork'
+      ? path.resolve(__dirname, '../patchwork/packages/components/src/generated')
+      : path.resolve(__dirname, '../storybook-app/src/components/Generated')),
 );
-const INDEX_CSS_PATH = path.resolve(
-  process.env.STORYBOOK_INDEX_CSS_PATH ?? path.resolve(__dirname, '../storybook-app/src/index.css'),
-);
+const INDEX_CSS_PATH = process.env.STORYBOOK_INDEX_CSS_PATH
+  ? path.resolve(process.env.STORYBOOK_INDEX_CSS_PATH)
+  : GENERATED_COMPONENT_FORMAT === 'patchwork'
+    ? undefined
+    : path.resolve(__dirname, '../storybook-app/src/index.css');
 const PROMPTS_DIR = path.resolve(process.env.PROMPTS_DIR ?? path.resolve(__dirname, '../prompts'));
 const PROMPT_FACTS_DIR = 'facts';
 const PROMPT_GUARDS_DIR = 'guards';
@@ -33,12 +39,60 @@ const DEFAULT_MODEL_BY_PROVIDER = {
   anthropic: 'claude-sonnet-4-6',
   openai: 'gpt-5-codex',
 } as const;
-const CODEX_AUTH_PATH = process.env.CODEX_AUTH_PATH ?? path.join(process.env.HOME ?? '/root', '.codex/auth.json');
 const generatedCodeByKey = new Map<string, string>();
 type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
 class LlmConfigurationError extends Error {}
 class PromptConfigurationError extends Error {}
+
+function getGeneratedComponentPaths(componentName: string) {
+  if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
+    const componentDir = path.join(GENERATED_DIR, componentName);
+
+    return {
+      componentDir,
+      componentPath: path.join(componentDir, 'index.tsx'),
+      storyPath: path.join(componentDir, 'stories.tsx'),
+    };
+  }
+
+  return {
+    componentDir: GENERATED_DIR,
+    componentPath: path.join(GENERATED_DIR, `${componentName}.tsx`),
+    storyPath: path.join(GENERATED_DIR, `${componentName}.stories.tsx`),
+  };
+}
+
+function getStoryCode(componentName: string) {
+  if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
+    return `import React from 'react';
+import ${componentName} from './index.jsx';
+
+export default {
+  title: 'Generated/${componentName}',
+  component: ${componentName},
+};
+
+export const Default = () => <${componentName} />;
+`;
+  }
+
+  return `import ${componentName} from './${componentName}'
+
+export default { title: 'Generated/${componentName}', component: ${componentName} };
+export const Default = {};
+`;
+}
+
+async function touchReloadFile() {
+  if (!INDEX_CSS_PATH) {
+    return;
+  }
+
+  let css = await fs.readFile(INDEX_CSS_PATH, 'utf-8');
+  css = css.replace(/\n?\/\* _tw-trigger: \d+ \*\/\n?$/, '');
+  await fs.writeFile(INDEX_CSS_PATH, css.trimEnd() + `\n/* _tw-trigger: ${Date.now()} */\n`);
+}
 
 function extractCode(responseText: string): string {
   const fenceMatch = responseText.match(/```(?:tsx|jsx|ts|js)?\n([\s\S]*?)```/);
@@ -134,70 +188,9 @@ function getConfiguredModel(provider: LlmProvider) {
   return DEFAULT_MODEL_BY_PROVIDER[provider];
 }
 
-function findOpenAIToken(value: unknown): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  if (typeof value === 'string') {
-    return value.trim() || undefined;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const token = findOpenAIToken(item);
-      if (token) {
-        return token;
-      }
-    }
-
-    return undefined;
-  }
-
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    const preferredKeys = ['api_key', 'apikey', 'key', 'access_token', 'token', 'id_token'];
-
-    for (const key of preferredKeys) {
-      const token = findOpenAIToken(record[key]);
-      if (token) {
-        return token;
-      }
-    }
-
-    for (const nestedValue of Object.values(record)) {
-      const token = findOpenAIToken(nestedValue);
-      if (token) {
-        return token;
-      }
-    }
-  }
-
-  return undefined;
-}
-
-async function getCodexAuthToken() {
-  try {
-    const rawAuth = await fs.readFile(CODEX_AUTH_PATH, 'utf-8');
-    const parsedAuth = JSON.parse(rawAuth) as unknown;
-    return findOpenAIToken(parsedAuth);
-  } catch (error) {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      (error.code === 'ENOENT' || error.code === 'EISDIR')
-    ) {
-      return undefined;
-    }
-
-    throw new LlmConfigurationError(`Unable to read Codex auth file at ${CODEX_AUTH_PATH}`);
-  }
-}
-
 async function resolveLlmConfig() {
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim();
-  const openaiApiKey = process.env.OPENAI_API_KEY?.trim() ?? (await getCodexAuthToken());
+  const openaiApiKey = process.env.OPENAI_API_KEY?.trim();
 
   if (anthropicApiKey) {
     return {
@@ -216,7 +209,7 @@ async function resolveLlmConfig() {
   }
 
   throw new LlmConfigurationError(
-    'LLM credentials required: set ANTHROPIC_API_KEY, OPENAI_API_KEY, or mount ~/.codex/auth.json',
+    'LLM credentials required: set ANTHROPIC_API_KEY or OPENAI_API_KEY',
   );
 }
 
@@ -360,19 +353,17 @@ app.post('/generate', async (req, res) => {
           );
 
     generatedCodeByKey.set(generationKey, componentCode);
-    await fs.writeFile(path.join(GENERATED_DIR, `${componentName}.tsx`), componentCode);
+    const { componentDir, componentPath, storyPath } = getGeneratedComponentPaths(componentName);
+    await fs.mkdir(componentDir, { recursive: true });
+    await fs.writeFile(componentPath, componentCode);
 
-    const storyPath = path.join(GENERATED_DIR, `${componentName}.stories.tsx`);
     try {
       await fs.access(storyPath);
     } catch {
-      const storyCode = `import ${componentName} from './${componentName}'\n\nexport default { title: 'Generated/${componentName}', component: ${componentName} };\nexport const Default = {};\n`;
-      await fs.writeFile(storyPath, storyCode);
+      await fs.writeFile(storyPath, getStoryCode(componentName));
     }
 
-    let css = await fs.readFile(INDEX_CSS_PATH, 'utf-8');
-    css = css.replace(/\n?\/\* _tw-trigger: \d+ \*\/\n?$/, '');
-    await fs.writeFile(INDEX_CSS_PATH, css.trimEnd() + `\n/* _tw-trigger: ${Date.now()} */\n`);
+    await touchReloadFile();
 
     res.json({ status: 'ok', componentName, code: componentCode, isFollowUp });
   } catch (err) {

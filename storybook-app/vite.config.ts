@@ -10,10 +10,24 @@ import { storybookTest } from '@storybook/addon-vitest/vitest-plugin';
 import { playwright } from '@vitest/browser-playwright';
 const dirname =
   typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+const patchworkRoot = process.env.PATCHWORK_ROOT?.trim();
+const storybookAppRoot = dirname;
 
 // More info at: https://storybook.js.org/docs/next/writing-tests/integrations/vitest-addon
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: patchworkRoot
+      ? {
+          '@patchwork': patchworkRoot,
+        }
+      : undefined,
+  },
+  server: {
+    fs: {
+      allow: [storybookAppRoot, patchworkRoot].filter(Boolean),
+    },
+  },
   test: {
     projects: [
       {

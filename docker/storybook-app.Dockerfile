@@ -1,40 +1,36 @@
-FROM node:24-alpine AS deps
+FROM node:24-alpine AS app_dev
 
-WORKDIR /workspace/storybook-app
+RUN apk add --no-cache bash g++ git make python3
+RUN corepack enable
 
-COPY storybook-app/package.json package.json
-COPY storybook-app/package-lock.json package-lock.json
+WORKDIR /workspace
 
-RUN npm ci
+COPY scripts/patchwork-app-dev-server.mjs /workspace/scripts/patchwork-app-dev-server.mjs
+COPY scripts/patchwork-app-server.mjs /workspace/scripts/patchwork-app-server.mjs
 
-FROM deps AS workspace
-
-COPY storybook-app ./
-
-RUN touch .env.local
-
-FROM workspace AS app_dev
+ENV PATCHWORK_ROOT=/workspace/patchwork
+ENV STORYBOOK_PORT=9001
 
 EXPOSE 9000
 
-CMD ["npm", "run", "start:dev"]
-
-FROM workspace AS build
-
-RUN npm run build-storybook
+CMD ["node", "/workspace/scripts/patchwork-app-dev-server.mjs"]
 
 FROM node:24-alpine AS app
 
-WORKDIR /workspace/storybook-app
+RUN apk add --no-cache bash g++ git make python3
+RUN corepack enable
+
+WORKDIR /workspace
+
+COPY patchwork /workspace/patchwork
+COPY scripts/patchwork-app-server.mjs /workspace/scripts/patchwork-app-server.mjs
+
+ENV PATCHWORK_ROOT=/workspace/patchwork
+ENV STORYBOOK_PORT=9001
 
 ARG APP_VERSION=dev
 ARG LAST_COMMIT_DATE="Thu Jan 1 00:00:00 1970 +0000"
 ARG BUILD_START_TIME=0
-
-COPY storybook-app/package.json package.json
-COPY --from=deps /workspace/storybook-app/node_modules ./node_modules
-COPY --from=workspace /workspace/storybook-app/server.mjs ./server.mjs
-COPY --from=build /workspace/storybook-app/storybook-static ./storybook-static
 
 ENV APP_VERSION="${APP_VERSION}"
 ENV LAST_COMMIT_DATE="${LAST_COMMIT_DATE}"
@@ -43,4 +39,4 @@ ENV PORT=9000
 
 EXPOSE 9000
 
-CMD ["npm", "run", "start:prod"]
+CMD ["node", "/workspace/scripts/patchwork-app-server.mjs"]

@@ -8,7 +8,7 @@ Use the current prompt config as the source of truth:
 
 - `prompts/facts/`
 
-Those files should answer the setup questions directly where we already know the repo/package assumptions, and explicitly flag anything that is still unknown or session-specific.
+Those files should answer the setup questions directly where we already know the repo/package assumptions, with the local `./patchwork` checkout as the target codebase, and explicitly flag anything that is still unknown or session-specific.
 
 Why first: without this, the component gets generated with either raw hex/px values or invented token names that don't match your real theme file — and in a multi-brand system, without step 4 it also risks getting one brand's colors hardcoded in as if they were universal. Without step 5, generation tends to reimplement things you already have.
 

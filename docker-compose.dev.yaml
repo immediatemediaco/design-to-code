@@ -7,8 +7,11 @@ services:
     env_file:
       - ${ENV_FILE_LOCAL:-.env.local}
     volumes:
-      - ./storybook-app:/workspace/storybook-app:rw,cached
-      - storybook_app_node_modules:/workspace/storybook-app/node_modules
+      - ./patchwork:/workspace/patchwork:rw,cached
+      - ./scripts:/workspace/scripts:rw,cached
+      - ~/.npmrc:/root/.npmrc:ro
+      - ~/.yarnrc:/root/.yarnrc:ro
+      - patchwork_node_modules:/workspace/patchwork/node_modules
 
   relay:
     image: ${APP_NAME:-design-to-code}-relay-dev:local
@@ -18,9 +21,10 @@ services:
       - ${ENV_FILE_LOCAL:-.env.local}
     volumes:
       - ./relay-server:/workspace/relay-server:rw,cached
-      - ./storybook-app:/workspace/storybook-app:rw,cached
+      - ./prompts:/workspace/prompts:rw,cached
+      - ./patchwork:/workspace/patchwork:rw,cached
       - relay_server_node_modules:/workspace/relay-server/node_modules
 
 volumes:
+  patchwork_node_modules:
   relay_server_node_modules:
-  storybook_app_node_modules:

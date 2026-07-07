@@ -1,0 +1,12 @@
+{
+  "name": "Design to Code",
+  "id": "design-to-code-poc",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["none"],
+    "devAllowedDomains": ["http://localhost:4000"]
+  }
+}

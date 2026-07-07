@@ -4,8 +4,8 @@ A proof-of-concept pipeline that turns a Figma design into a live React componen
 
 ## How it works
 
-1. A **relay server** receives a `POST /generate` request containing a Figma node tree, component name, and an optional screenshot.
-2. It sends the design data to **Claude** (via the Anthropic SDK), which generates a Tailwind-styled React component.
+1. A **Figma plugin** serialises the selected frame — its node tree, a 2× PNG screenshot, and an optional prompt — and POSTs them to the relay server.
+2. The **relay server** forwards the data to **Claude** (via the Anthropic SDK), which generates a Tailwind-styled React component.
 3. The component and a matching Storybook story are written into `storybook-app/src/components/Generated/`.
 4. Vite's HMR picks up the new files and the component appears in Storybook automatically.
 
@@ -13,6 +13,7 @@ A proof-of-concept pipeline that turns a Figma design into a live React componen
 
 ```
 design-to-code/
+├── figma-plugin/       # Figma plugin — serialises the selected frame and sends it to the relay server
 ├── relay-server/       # Express server — calls Claude and writes generated component files
 └── storybook-app/      # React + Vite + Tailwind app with Storybook for live component preview
 ```
@@ -37,21 +38,6 @@ npx tsx server.ts
 
 The server starts on **http://localhost:4000**.
 
-#### Generating a component
-
-Send a `POST /generate` request with a `componentName` and a `nodeTree` (Figma node JSON). An optional `imageBase64` (PNG) can be included to give Claude a visual reference:
-
-```bash
-curl -X POST http://localhost:4000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "componentName": "PrimaryButton",
-    "nodeTree": { "type": "FRAME", "name": "PrimaryButton" }
-  }'
-```
-
-The response includes `{ status, componentName, code }`.
-
 ### 2. Storybook
 
 ```bash
@@ -62,68 +48,26 @@ npm run storybook
 
 Storybook starts on **http://localhost:6006**. Generated components appear under the **Generated** section in the sidebar as soon as the relay server writes them. Stories are only created on first generation — subsequent requests update the component file without overwriting the story.
 
+### 3. Figma plugin
+
+1. In Figma, open **Menu → Plugins → Development → Import plugin from manifest…**
+2. Select `figma-plugin/manifest.json` from this repo.
+3. Run the plugin from **Menu → Plugins → Development → Design to Code**.
+
+The plugin UI presents an optional free-text prompt field and a **Generate component** button. When you click the button, the plugin:
+
+- Reads the currently selected frame on the canvas.
+- Serialises its node tree (layout, fills, corner radius, typography, children).
+- Exports a 2× PNG screenshot of the frame.
+- POSTs the component name, node tree, screenshot, and any prompt text to `http://localhost:4000/generate`.
+
+A status message confirms success or surfaces any error (e.g. no frame selected, relay server unreachable).
+
+> **Note:** The plugin communicates with `localhost:4000` during development. The manifest restricts network access to that origin only (`devAllowedDomains`). For a production build you would need to update `networkAccess.allowedDomains` accordingly.
+
 ## Prerequisites
 
 - Node.js 18+
 - npm
 - Anthropic API key
-- Figma account with a personal access token
-
-## Getting the Figma node tree
-
-The `nodeTree` field in the `/generate` request is the raw Figma node JSON for a component. Here's how to obtain it.
-
-### 1. Copy the component link from Figma
-
-1. Open your file in Figma.
-2. Right-click the component layer in the canvas or layers panel.
-3. Select **Copy/Paste as → Copy link to selection**.
-
-This copies a URL like:
-
-```
-https://www.figma.com/design/MSz1zYzubDs5ZHAP7jTylp/Design-to-Code-Example?node-id=2-2&t=3x89TOGdjgPzjUzb-4
-```
-
-From this URL extract two values:
-
-| Value     | Where                                                   | Example                  |
-| --------- | ------------------------------------------------------- | ------------------------ |
-| `fileKey` | The path segment after `/design/`                       | `MSz1zYzubDs5ZHAP7jTylp` |
-| `nodeId`  | The `node-id` query parameter, with `-` replaced by `:` | `2:2`                    |
-
-### 2. Create a Figma personal access token
-
-Go to **Figma → Settings → Security** and generate a personal access token.
-
-### 3. Fetch the node from the Figma API
-
-```bash
-curl -H "X-Figma-Token: <YOUR_TOKEN>" \
-  "https://api.figma.com/v1/files/<fileKey>/nodes?ids=<nodeId>"
-```
-
-Using the example values above:
-
-```bash
-curl -H "X-Figma-Token: <YOUR_TOKEN>" \
-  "https://api.figma.com/v1/files/MSz1zYzubDs5ZHAP7jTylp/nodes?ids=2:2"
-```
-
-### 4. Extract the document object
-
-The response has the shape:
-
-```json
-{
-  "nodes": {
-    "2:2": {
-      "document": {
-        // ← this is the nodeTree you pass to /generate
-      }
-    }
-  }
-}
-```
-
-Pass the value of `document` as `nodeTree` in your `/generate` request.
+- Figma desktop app (for running the plugin in development mode)

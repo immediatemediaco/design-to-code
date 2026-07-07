@@ -3,6 +3,8 @@
     "@anthropic-ai/sdk": "^0.107.0"
   },
   "devDependencies": {
-    "dotenv": "^17.4.2"
+    "@figma/plugin-typings": "^1.130.0",
+    "dotenv": "^17.4.2",
+    "typescript": "^6.0.3"
   }
 }

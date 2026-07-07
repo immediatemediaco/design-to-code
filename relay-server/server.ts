@@ -3,9 +3,10 @@ import cors from 'cors';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import 'dotenv/config';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 import Anthropic from '@anthropic-ai/sdk';
 
 const anthropic = new Anthropic();
@@ -26,45 +27,69 @@ Rules:
 - Use semantic HTML elements where appropriate.
 - Map Figma auto-layout frames to flex containers (flex-row or flex-col, gap-*, p-*).
 - Map Figma fills to Tailwind background/text color classes, approximating to the nearest Tailwind color if an exact hex isn't available.
-- Do not invent props or external dependencies. No imports beyond React itself.`;
+- Do not invent props or external dependencies. No imports beyond React itself.
+- When the user provides additional instructions, prioritise satisfying them while keeping the component visually close to the original design.`;
+
+type HistoryEntry = Anthropic.MessageParam;
+
+const conversationHistory = new Map<string, HistoryEntry[]>();
 
 function extractCode(responseText: string): string {
-  // Strip markdown fences if the model adds them despite instructions
   const fenceMatch = responseText.match(/```(?:tsx|jsx|ts|js)?\n([\s\S]*?)```/);
   return fenceMatch ? (fenceMatch[1] ?? '').trim() : responseText.trim();
 }
 
 app.post('/generate', async (req, res) => {
   try {
-    const { componentName, nodeTree, imageBase64 } = req.body;
+    const { componentName, nodeTree, imageBase64, prompt } = req.body;
+
+    // Log out the prompt
+    console.log('Received prompt:', prompt);
 
     if (!componentName || !nodeTree) {
       return res.status(400).json({ error: 'Missing componentName or nodeTree' });
     }
 
-    const userContent: Anthropic.MessageParam['content'] = [
-      {
-        type: 'text',
-        text: `Generate a React component named "${componentName}" from this Figma node tree:\n\n${JSON.stringify(nodeTree, null, 2)}`,
-      },
-    ];
+    const isFollowUp = conversationHistory.has(componentName);
+    const history = conversationHistory.get(componentName) ?? [];
 
-    if (imageBase64) {
-      userContent.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: 'image/png',
-          data: imageBase64,
+    let userContent: Anthropic.MessageParam['content'];
+
+    if (!isFollowUp) {
+      userContent = [
+        {
+          type: 'text',
+          text: [
+            `Generate a React component named "${componentName}" from this Figma node tree:`,
+            JSON.stringify(nodeTree, null, 2),
+            prompt ? `\nAdditional instructions from the designer: ${prompt}` : '',
+          ].join('\n'),
         },
-      });
+      ];
+      if (imageBase64) {
+        userContent.push({
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: imageBase64 },
+        });
+      }
+    } else {
+      userContent = [
+        {
+          type: 'text',
+          text: prompt
+            ? `Update the component based on this feedback: ${prompt}`
+            : 'Regenerate the component, keeping it consistent with the original design.',
+        },
+      ];
     }
+
+    const messages: HistoryEntry[] = [...history, { role: 'user', content: userContent }];
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2000,
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userContent }],
+      messages,
     });
 
     const textBlock = response.content.find((block) => block.type === 'text');
@@ -74,13 +99,18 @@ app.post('/generate', async (req, res) => {
 
     const componentCode = extractCode(textBlock.text);
 
+    conversationHistory.set(componentName, [
+      ...messages,
+      { role: 'assistant', content: textBlock.text },
+    ]);
+
     await fs.writeFile(path.join(GENERATED_DIR, `${componentName}.tsx`), componentCode);
 
     const storyPath = path.join(GENERATED_DIR, `${componentName}.stories.tsx`);
     try {
       await fs.access(storyPath);
     } catch {
-      const storyCode = `import ${componentName} from './${componentName}'\n\nexport default { title: 'Generated/${componentName}', component: ${componentName} };\nexport const Default = {};\n`;
+      const storyCode = `import ${componentName} from './${componentName}';\n\nexport default { title: 'Generated/${componentName}', component: ${componentName} };\nexport const Default = {};\n`;
       await fs.writeFile(storyPath, storyCode);
     }
 
@@ -91,7 +121,7 @@ app.post('/generate', async (req, res) => {
     css = css.replace(/\n?\/\* _tw-trigger: \d+ \*\/\n?$/, '');
     await fs.writeFile(indexCssPath, css.trimEnd() + `\n/* _tw-trigger: ${Date.now()} */\n`);
 
-    res.json({ status: 'ok', componentName, code: componentCode });
+    res.json({ status: 'ok', componentName, code: componentCode, isFollowUp });
   } catch (err) {
     console.error('Generation failed:', err);
     res.status(500).json({ error: 'Generation failed', detail: String(err) });
@@ -99,4 +129,4 @@ app.post('/generate', async (req, res) => {
 });
 
 const PORT = 4000;
-app.listen(PORT, () => console.log(`Relay server listening on: ${PORT}`));
+app.listen(PORT, () => console.log(`Relay server listening on :${PORT}`));

@@ -50,6 +50,7 @@ figma.ui.onmessage = async (msg) => {
         const base64 = figma.base64Encode(imageBytes);
         figma.ui.postMessage({
             type: 'serialized',
+            nodeId: node.id,
             componentName: node.name.replace(/\s+/g, ''),
             nodeTree,
             imageBase64: base64,

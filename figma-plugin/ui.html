@@ -91,6 +91,7 @@
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
+                nodeId: msg.nodeId,
                 componentName: msg.componentName,
                 nodeTree: msg.nodeTree,
                 imageBase64: msg.imageBase64,

@@ -43,7 +43,7 @@ const DEFAULT_MODEL_BY_PROVIDER = {
   openai: 'gpt-5-codex',
 } as const;
 const CODEX_AUTH_PATH = process.env.CODEX_AUTH_PATH ?? path.join(process.env.HOME ?? '/root', '.codex/auth.json');
-const generatedCodeByComponent = new Map<string, string>();
+const generatedCodeByKey = new Map<string, string>();
 type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
 class LlmConfigurationError extends Error {}
@@ -250,13 +250,15 @@ async function generateWithOpenAI(
 
 app.post('/generate', async (req, res) => {
   try {
-    const { componentName, nodeTree, imageBase64, prompt } = req.body;
+    const { nodeId, componentName, nodeTree, imageBase64, prompt } = req.body;
 
     if (!componentName || !nodeTree) {
       return res.status(400).json({ error: 'Missing componentName or nodeTree' });
     }
 
-    const previousCode = generatedCodeByComponent.get(componentName);
+    const generationKey =
+      typeof nodeId === 'string' && nodeId.trim().length > 0 ? nodeId.trim() : componentName;
+    const previousCode = generatedCodeByKey.get(generationKey);
     const isFollowUp = Boolean(previousCode);
     const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
     const llmConfig = await resolveLlmConfig();
@@ -265,7 +267,7 @@ app.post('/generate', async (req, res) => {
         ? await generateWithOpenAI(llmConfig.apiKey, llmConfig.model, requestText, imageBase64)
         : await generateWithAnthropic(llmConfig.apiKey, llmConfig.model, requestText, imageBase64);
 
-    generatedCodeByComponent.set(componentName, componentCode);
+    generatedCodeByKey.set(generationKey, componentCode);
     await fs.writeFile(path.join(GENERATED_DIR, `${componentName}.tsx`), componentCode);
 
     const storyPath = path.join(GENERATED_DIR, `${componentName}.stories.tsx`);

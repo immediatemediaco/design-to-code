@@ -107,7 +107,7 @@ The plugin:
 - Sends the request to `http://localhost:8516/generate`, which flows through the local Docker/proxy stack.
 - Lets you add an optional prompt for the first generation or follow-up refinements.
 
-To rebuild the plugin controller after editing [figma-plugin/code.ts](/private/tmp/design-to-code-pr5-fix/figma-plugin/code.ts):
+To rebuild the plugin controller after editing `figma-plugin/code.ts`:
 
 ```bash
 yarn plugin:build

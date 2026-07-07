@@ -1,48 +1,75 @@
 # design-to-code
 
-A proof-of-concept pipeline that turns a Figma design into a live React component, instantly visible in Storybook — without a page reload.
+A proof-of-concept pipeline that turns a Figma design into a live React component, instantly visible in Storybook without a page reload.
 
 ## How it works
 
-1. A **relay server** receives a `POST /generate` request containing a Figma node tree, component name, and an optional screenshot.
-2. It sends the design data to **Claude** (via the Anthropic SDK), which generates a Tailwind-styled React component.
-3. The component and a matching Storybook story are written into `storybook-app/src/components/Generated/`.
-4. Vite's HMR picks up the new files and the component appears in Storybook automatically.
+1. The **relay server** receives a `POST /generate` request containing a Figma node tree, component name, and optional screenshot.
+2. It sends the design data to **Claude** and generates a Tailwind-styled React component.
+3. The component and story are written into `storybook-app/src/components/Generated/`.
+4. Storybook reloads through the shared Docker stack, served behind the local localhost proxy.
 
 ## Project structure
 
-```
+```text
 design-to-code/
-├── relay-server/       # Express server — calls Claude and writes generated component files
-└── storybook-app/      # React + Vite + Tailwind app with Storybook for live component preview
+├── docker/                 # Container build definitions
+├── relay-server/           # Express relay that calls Claude and writes generated files
+├── scripts/                # Local orchestration helpers
+└── storybook-app/          # Storybook host app for live component preview
 ```
+
+## Prerequisites
+
+- Docker Desktop
+- npm
+- Anthropic API key
+- The local reverse proxy used by the pipeline dashboard repos
 
 ## Running locally
 
-### 1. Relay server
+Set your Anthropic key in `.env.local`:
 
-Create a `.env` file inside `relay-server/` with your Anthropic API key:
-
-```
+```bash
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Then start the server:
+Then use the root orchestration commands:
 
 ```bash
-cd relay-server
-npm install
-npx tsx server.ts
+npm run setup
 ```
 
-The server starts on **http://localhost:4000**.
-
-#### Generating a component
-
-Send a `POST /generate` request with a `componentName` and a `nodeTree` (Figma node JSON). An optional `imageBase64` (PNG) can be included to give Claude a visual reference:
+For day-to-day use after the first install:
 
 ```bash
-curl -X POST http://localhost:4000/generate \
+npm run start
+```
+
+That will:
+
+1. Ensure the local reverse proxy is running.
+2. Generate `docker-compose.yaml` from the same template-driven pattern as the pipeline dashboard repos.
+3. Build and start the Storybook app, nginx frontend, cache layer, and relay server in Docker.
+
+Primary URLs:
+
+- Storybook: `https://design-to-code.localhost`
+- Cached route: `https://design-to-code.cached.localhost`
+- Direct forwarded nginx port: `http://localhost:8516`
+
+To stop the stack:
+
+```bash
+npm run stop
+```
+
+## Generating a component
+
+Send the request through the proxied app host so the Storybook container and relay stay under one local hostname:
+
+```bash
+curl -k -X POST https://design-to-code.localhost/generate \
   -H "Content-Type: application/json" \
   -d '{
     "componentName": "PrimaryButton",
@@ -52,22 +79,13 @@ curl -X POST http://localhost:4000/generate \
 
 The response includes `{ status, componentName, code }`.
 
-### 2. Storybook
+Generated components appear under the **Generated** section in Storybook. Stories are only created on first generation; later requests update the component file without overwriting the story.
 
-```bash
-cd storybook-app
-npm install
-npm run storybook
-```
+## Notes
 
-Storybook starts on **http://localhost:6006**. Generated components appear under the **Generated** section in the sidebar as soon as the relay server writes them. Stories are only created on first generation — subsequent requests update the component file without overwriting the story.
-
-## Prerequisites
-
-- Node.js 18+
-- npm
-- Anthropic API key
-- Figma account with a personal access token
+- `relay-server` now runs in Docker and writes into the bind-mounted `storybook-app` source tree.
+- Storybook proxies `/generate` to the internal relay container in dev, so browser traffic can stay on the same proxied hostname.
+- `docker-compose-generator.sh` mirrors the command shape used in the pipeline dashboard repos.
 
 ## Getting the Figma node tree
 

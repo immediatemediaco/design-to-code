@@ -1,0 +1,33 @@
+---
+services:
+  app:
+    build:
+      context: .
+      dockerfile: ./docker/storybook-app.Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-}
+        BUILD_START_TIME: ${BUILD_START_TIME:-}
+        LAST_COMMIT_DATE: ${LAST_COMMIT_DATE:-}
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      PORT: 9000
+      RELAY_TARGET: ${RELAY_TARGET:-http://relay:4000}
+      STORYBOOK_RELAY_TARGET: ${STORYBOOK_RELAY_TARGET:-http://relay:4000}
+    depends_on:
+      - relay
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  relay:
+    build:
+      context: .
+      dockerfile: ./docker/relay-server.Dockerfile
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      PORT: 4000
+      GENERATED_DIR: /workspace/storybook-app/src/components/Generated
+      STORYBOOK_INDEX_CSS_PATH: /workspace/storybook-app/src/index.css
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

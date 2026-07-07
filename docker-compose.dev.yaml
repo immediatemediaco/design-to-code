@@ -1,0 +1,26 @@
+---
+services:
+  app:
+    image: ${APP_NAME:-design-to-code}-app-dev:local
+    build:
+      target: app_dev
+    env_file:
+      - ${ENV_FILE_LOCAL:-.env.local}
+    volumes:
+      - ./storybook-app:/workspace/storybook-app:rw,cached
+      - storybook_app_node_modules:/workspace/storybook-app/node_modules
+
+  relay:
+    image: ${APP_NAME:-design-to-code}-relay-dev:local
+    build:
+      target: relay_dev
+    env_file:
+      - ${ENV_FILE_LOCAL:-.env.local}
+    volumes:
+      - ./relay-server:/workspace/relay-server:rw,cached
+      - ./storybook-app:/workspace/storybook-app:rw,cached
+      - relay_server_node_modules:/workspace/relay-server/node_modules
+
+volumes:
+  relay_server_node_modules:
+  storybook_app_node_modules:

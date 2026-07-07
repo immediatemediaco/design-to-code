@@ -15,10 +15,11 @@
     "logs": "docker compose logs -f app relay nginx cache",
     "util:install": "npm install",
     "util:build-env:local": "touch .env.local && touch relay-server/.env.local && touch storybook-app/.env.local",
-    "util:is-ready": "node ./scripts/wait-for-url.mjs https://${APP_NAME:-design-to-code}.localhost/healthz"
+    "util:is-ready": "is-container-ready -f docker-compose.yaml -k app -m 'ready in'"
   },
   "dependencies": {
     "@immediate_media/docker-templates": "^5.5.0",
-    "@immediate_media/local-reverse-proxy-orchestrator": "^1.3.1"
+    "@immediate_media/local-reverse-proxy-orchestrator": "^1.3.1",
+    "@immediate_media/symfony-pipeline-scripts": "^1.2.4"
   }
 }

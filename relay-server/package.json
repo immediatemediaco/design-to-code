@@ -13,6 +13,7 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.107.0",
+    "openai": "^5.23.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1"

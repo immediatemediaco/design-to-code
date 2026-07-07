@@ -25,6 +25,10 @@ compose_files=(
   -f docker-compose.base.yaml
 )
 
+if [[ -f "${HOME}/.codex/auth.json" ]]; then
+  compose_files+=(-f docker-compose.codex-auth.yaml)
+fi
+
 if [[ "$dev" == "true" ]]; then
   compose_files+=(-f docker-compose.dev.yaml)
 fi

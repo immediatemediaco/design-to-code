@@ -2,6 +2,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
+import fs from 'node:fs/promises';
 
 const appPort = Number(process.env.PORT ?? 9000);
 const storybookPort = Number(process.env.STORYBOOK_PORT ?? 9001);
@@ -165,34 +166,76 @@ async function waitForStorybook() {
   }
 }
 
-async function main() {
-  await ensurePatchworkDependencies();
-  await ensurePatchworkBuildArtifacts();
+function spawnPatchworkProcess(label, args) {
+  const child = spawn('yarn', args, {
+    cwd: patchworkRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: process.env,
+  });
 
-  const storybookProcess = spawn(
-    'yarn',
-    ['--cwd', 'packages/storybook', 'storybook', 'dev', '--ci', '--host', '0.0.0.0', '-c', '.storybook', '-p', String(storybookPort)],
-    {
-      cwd: patchworkRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    },
-  );
+  forwardStream(child.stdout, process.stdout);
+  forwardStream(child.stderr, process.stderr);
 
-  forwardStream(storybookProcess.stdout, process.stdout);
-  forwardStream(storybookProcess.stderr, process.stderr);
-
-  storybookProcess.on('exit', (code, signal) => {
+  child.on('exit', (code, signal) => {
     if (signal) {
       process.kill(process.pid, signal);
       return;
     }
 
-    process.exit(code ?? 0);
+    console.error(`${label} exited with code ${code ?? 1}`);
+    process.exit(code ?? 1);
   });
 
-  process.on('SIGINT', () => storybookProcess.kill('SIGINT'));
-  process.on('SIGTERM', () => storybookProcess.kill('SIGTERM'));
+  return child;
+}
+
+async function waitForStylesManifest(manifestPath) {
+  while (true) {
+    try {
+      await fs.access(manifestPath);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
+async function main() {
+  await ensurePatchworkDependencies();
+  await ensurePatchworkBuildArtifacts();
+
+  // Generated components land with a fresh styles.scss on every /generate call.
+  // @immediate_media/styles globs packages/components/src/**/*.scss at build
+  // time, so without its own watcher running here those new stylesheets would
+  // sit on disk uncompiled and never reach the browser. Its `dev` script wipes
+  // and rebuilds dist/manifest.json from scratch on startup, so storybook must
+  // not resolve that manifest until this initial build has actually landed.
+  // Remove any manifest left over from a previous container run first — the
+  // bind-mounted dist dir can otherwise let the wait below pass immediately
+  // against a stale file, racing storybook against dev.js's own wipe-and-rebuild.
+  const manifestPath = path.join(patchworkRoot, 'packages/styles/dist/manifest.json');
+  await fs.rm(manifestPath, { force: true });
+
+  const stylesProcess = spawnPatchworkProcess(
+    'styles',
+    ['--cwd', 'packages/styles', 'dev'],
+  );
+
+  await waitForStylesManifest(manifestPath);
+
+  const storybookProcess = spawnPatchworkProcess(
+    'storybook',
+    ['--cwd', 'packages/storybook', 'storybook', 'dev', '--ci', '--host', '0.0.0.0', '-c', '.storybook', '-p', String(storybookPort)],
+  );
+
+  process.on('SIGINT', () => {
+    storybookProcess.kill('SIGINT');
+    stylesProcess.kill('SIGINT');
+  });
+  process.on('SIGTERM', () => {
+    storybookProcess.kill('SIGTERM');
+    stylesProcess.kill('SIGTERM');
+  });
 
   server.listen(appPort, '0.0.0.0');
   await waitForStorybook();

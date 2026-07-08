@@ -22,6 +22,18 @@
       "
     ></div>
 
+    <input
+      id="componentName"
+      type="text"
+      placeholder="Component name (optional — defaults to the layer name)"
+      style="
+        width: 100%;
+        box-sizing: border-box;
+        margin-bottom: 8px;
+        padding: 6px 8px;
+        font-family: sans-serif;
+      "
+    />
     <textarea
       id="prompt"
       placeholder="Optional: describe the component or request a change (e.g. 'make the corners more rounded')"
@@ -39,6 +51,7 @@
     <script>
       const relayUrl = 'https://design-to-code.localhost/generate';
       const statusEl = document.getElementById('status');
+      const componentNameEl = document.getElementById('componentName');
       const promptEl = document.getElementById('prompt');
       const historyEl = document.getElementById('history');
 
@@ -67,13 +80,72 @@
 
       document.getElementById('generate').onclick = () => {
         const promptText = promptEl.value.trim();
+        const componentName = componentNameEl.value.trim();
         statusEl.textContent = 'Reading selection...';
 
         addBubble('designer', promptText || '(generate from design, no extra instructions)');
         promptEl.value = '';
 
-        parent.postMessage({ pluginMessage: { type: 'generate', prompt: promptText } }, '*');
+        parent.postMessage(
+          { pluginMessage: { type: 'generate', prompt: promptText, componentName } },
+          '*'
+        );
       };
+
+      // The plugin predicts each task's componentName before any network call
+      // (it can't know the relay's sanitization rules), but the relay is the
+      // one that actually decides the final, on-disk name (e.g. "Span&Ticker"
+      // becomes "SpanTicker"). If a child's real name differs from what was
+      // predicted, every later task whose nodeTree references that child via
+      // GENERATED_COMPONENT_REF needs patching, or the parent ends up
+      // importing a path that was never actually written.
+      function patchGeneratedRefs(node, fromName, toName) {
+        if (!node || typeof node !== 'object') return;
+
+        if (node.type === 'GENERATED_COMPONENT_REF' && node.generatedComponentName === fromName) {
+          node.generatedComponentName = toName;
+        }
+
+        if (Array.isArray(node.children)) {
+          node.children.forEach((child) => patchGeneratedRefs(child, fromName, toName));
+        }
+      }
+
+      async function generateTask(task, { prompt, label }) {
+        statusEl.textContent = label;
+
+        try {
+          const res = await fetch(relayUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              nodeId: task.nodeId,
+              componentName: task.componentName,
+              nodeTree: task.nodeTree,
+              imageBase64: task.imageBase64,
+              prompt,
+            }),
+          });
+          const data = await res.json();
+
+          if (res.ok && data.status === 'ok') {
+            statusEl.textContent = `Generated ${data.componentName}`;
+            addBubble(
+              'assistant',
+              data.isFollowUp ? `Updated ${data.componentName}.` : `Generated ${data.componentName}.`
+            );
+            return { ok: true, componentName: data.componentName };
+          }
+
+          statusEl.textContent = data.detail ?? data.error ?? 'Generation failed';
+          addBubble('assistant', `${task.componentName}: ${data.detail ?? data.error ?? 'Generation failed.'}`);
+          return { ok: false };
+        } catch (err) {
+          statusEl.textContent = 'Could not reach relay server';
+          addBubble('assistant', `${task.componentName}: could not reach relay server.`);
+          return { ok: false };
+        }
+      }
 
       window.onmessage = async (event) => {
         const msg = event.data.pluginMessage;
@@ -84,35 +156,30 @@
           return;
         }
 
-        if (msg.type === 'serialized') {
-          statusEl.textContent = 'Sending to relay server...';
-          try {
-            const res = await fetch(relayUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                nodeId: msg.nodeId,
-                componentName: msg.componentName,
-                nodeTree: msg.nodeTree,
-                imageBase64: msg.imageBase64,
-                prompt: msg.prompt,
-              }),
-            });
-            const data = await res.json();
+        if (msg.type === 'plan') {
+          const { tasks, prompt } = msg;
 
-            if (res.ok && data.status === 'ok') {
-              statusEl.textContent = `Generated ${data.componentName}`;
-              addBubble(
-                'assistant',
-                data.isFollowUp ? 'Updated the component.' : `Generated ${data.componentName}.`
-              );
-            } else {
-              statusEl.textContent = data.detail ?? data.error ?? 'Generation failed';
-              addBubble('assistant', data.detail ?? data.error ?? 'Generation failed.');
+          // Children are ordered before their parent. Run them one at a time
+          // (not in parallel) so each is a fully independent, atomic
+          // generate-and-write step, and so the parent — generated last —
+          // can compose whichever children succeeded.
+          for (let i = 0; i < tasks.length; i += 1) {
+            const task = tasks[i];
+            const isRootTask = i === tasks.length - 1;
+            const label = tasks.length > 1
+              ? `Generating ${task.componentName} (${i + 1}/${tasks.length})...`
+              : `Generating ${task.componentName}...`;
+
+            // The designer's free-text prompt describes the thing they
+            // selected, not each auto-discovered child, so only the root
+            // (final) task gets it.
+            const result = await generateTask(task, { prompt: isRootTask ? prompt : undefined, label });
+
+            if (result.ok && result.componentName !== task.componentName) {
+              for (let j = i + 1; j < tasks.length; j += 1) {
+                patchGeneratedRefs(tasks[j].nodeTree, task.componentName, result.componentName);
+              }
             }
-          } catch (err) {
-            statusEl.textContent = 'Could not reach relay server';
-            addBubble('assistant', 'Could not reach relay server.');
           }
         }
       };

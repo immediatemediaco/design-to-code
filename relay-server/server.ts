@@ -16,6 +16,23 @@ import type {
 } from 'openai/resources/responses/responses';
 
 const app = express();
+
+// Figma's plugin UI runs in a sandboxed iframe (Origin: null) inside a
+// Chromium-based desktop shell. Chromium's Private Network Access policy
+// treats that as the least-trusted network context, and since this host
+// resolves to loopback via the local reverse proxy, it requires an explicit
+// opt-in on the preflight response or it silently blocks the request — which
+// surfaces to the plugin as a generic "failed to fetch", not a CORS error.
+// The `cors` middleware has no option for this header, and since it ends
+// OPTIONS requests itself, this must run before it to have any effect.
+app.use((req, res, next) => {
+  if (req.headers['access-control-request-private-network']) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+
+  next();
+});
+
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
@@ -24,7 +41,7 @@ const GENERATED_DIR = path.resolve(
   process.env.GENERATED_DIR ??
     (GENERATED_COMPONENT_FORMAT === 'patchwork'
       ? path.resolve(__dirname, '../patchwork/packages/components/src/generated')
-      : path.resolve(__dirname, '../storybook-app/src/components/Generated')),
+      : path.resolve(__dirname, '../storybook-app/src/components/Generated'))
 );
 const INDEX_CSS_PATH = process.env.STORYBOOK_INDEX_CSS_PATH
   ? path.resolve(process.env.STORYBOOK_INDEX_CSS_PATH)
@@ -37,10 +54,9 @@ const PROMPT_GUARDS_DIR = 'guards';
 const SYSTEM_PROMPT_ENTRYPOINT = process.env.SYSTEM_PROMPT_FILE ?? 'import.md';
 
 const DEFAULT_MODEL_BY_PROVIDER = {
-  anthropic: 'claude-sonnet-4-6',
+  anthropic: 'claude-sonnet-5',
   openai: 'gpt-5-codex',
 } as const;
-const generatedCodeByKey = new Map<string, string>();
 type LlmProvider = keyof typeof DEFAULT_MODEL_BY_PROVIDER;
 
 class LlmConfigurationError extends Error {}
@@ -56,7 +72,7 @@ function logEvent(event: string, payload: Record<string, unknown>) {
       timestamp: new Date().toISOString(),
       event,
       ...payload,
-    }),
+    })
   );
 }
 
@@ -72,6 +88,38 @@ function getImageSummary(imageBase64: string | undefined) {
   };
 }
 
+/**
+ * Figma layer names routinely contain characters that are invalid in a JS
+ * identifier — variant/property layers in particular are named things like
+ * "Property 1=Default" or "Size=Large, State=Hover". Used verbatim, that
+ * breaks the generated `import Name from './index.jsx'` and `const Name`
+ * declarations with a syntax error that then fails the whole webpack build
+ * (stories are glob-included, so one bad file blocks every story).
+ */
+function sanitizeComponentName(rawName: string): string {
+  const segments = rawName.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  const pascalCased = segments
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join('');
+
+  if (!pascalCased) {
+    return 'GeneratedComponent';
+  }
+
+  return /^[A-Za-z_$]/.test(pascalCased) ? pascalCased : `Component${pascalCased}`;
+}
+
+function kebabCase(value: string) {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/[\s_]+/g, '-')
+    .toLowerCase();
+}
+
+function getRootClassName(componentName: string) {
+  return `generated-${kebabCase(componentName)}`;
+}
+
 function getGeneratedComponentPaths(componentName: string) {
   if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
     const componentDir = path.join(GENERATED_DIR, componentName);
@@ -79,6 +127,8 @@ function getGeneratedComponentPaths(componentName: string) {
     return {
       componentDir,
       componentPath: path.join(componentDir, 'index.tsx'),
+      stylesPath: path.join(componentDir, 'styles.scss'),
+      testPath: path.join(componentDir, 'index.test.tsx'),
       storyPath: path.join(componentDir, 'stories.tsx'),
     };
   }
@@ -86,8 +136,56 @@ function getGeneratedComponentPaths(componentName: string) {
   return {
     componentDir: GENERATED_DIR,
     componentPath: path.join(GENERATED_DIR, `${componentName}.tsx`),
+    stylesPath: undefined,
+    testPath: undefined,
     storyPath: path.join(GENERATED_DIR, `${componentName}.stories.tsx`),
   };
+}
+
+/**
+ * Follow-up context comes from whatever is actually on disk for this
+ * component name, not an in-memory cache — that way "update the existing
+ * component" works the same whether it was generated five minutes ago or
+ * before the relay last restarted, and regardless of which Figma nodeId
+ * triggered it.
+ */
+async function readExistingComponentCode(componentPath: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(componentPath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+}
+
+const PATCHWORK_OUTPUT_FILES = ['index.tsx', 'styles.scss', 'index.test.tsx'] as const;
+
+/**
+ * The patchwork format needs three files out of one LLM response (component,
+ * SCSS, test). Require an explicit `### FILE: <name>` + fenced-block-per-file
+ * shape (mandated by the output-shape guard prompt) rather than guessing at
+ * boundaries from a single blob of code.
+ */
+function parseMultiFileResponse(responseText: string): Record<string, string> {
+  // Tolerate a blank line (or more) between the "### FILE:" header and the
+  // opening fence — models routinely add one as natural markdown formatting,
+  // and requiring them adjacent caused every file to go "missing" at once.
+  const filePattern = /###\s*FILE:\s*([^\n]+)\n+```[a-zA-Z]*\n([\s\S]*?)```/g;
+  const files: Record<string, string> = {};
+
+  for (const match of responseText.matchAll(filePattern)) {
+    const fileName = match[1]!.trim();
+    const fileContent = match[2]!.trim();
+    files[fileName] = fileContent;
+  }
+
+  const missing = PATCHWORK_OUTPUT_FILES.filter((fileName) => !files[fileName]);
+  if (missing.length > 0) {
+    throw new Error(
+      `Model response did not include the required file section(s): ${missing.join(', ')}`
+    );
+  }
+
+  return files;
 }
 
 function getStoryCode(componentName: string) {
@@ -130,7 +228,9 @@ async function loadPromptFile(relativePath: string, seen = new Set<string>()): P
   const normalizedPath = path.posix.normalize(relativePath);
 
   if (normalizedPath.startsWith('..')) {
-    throw new PromptConfigurationError(`Prompt import escapes the prompts directory: ${relativePath}`);
+    throw new PromptConfigurationError(
+      `Prompt import escapes the prompts directory: ${relativePath}`
+    );
   }
 
   if (seen.has(normalizedPath)) {
@@ -236,7 +336,7 @@ async function resolveLlmConfig() {
   }
 
   throw new LlmConfigurationError(
-    'LLM credentials required: set ANTHROPIC_API_KEY or OPENAI_API_KEY',
+    'LLM credentials required: set ANTHROPIC_API_KEY or OPENAI_API_KEY'
   );
 }
 
@@ -244,19 +344,25 @@ function buildGenerationPrompt(
   componentName: string,
   nodeTree: unknown,
   prompt: string | undefined,
-  previousCode: string | undefined,
+  previousCode: string | undefined
 ) {
   const sections = [
     `Generate a React component named "${componentName}".`,
     `Figma node tree:\n${JSON.stringify(nodeTree, null, 2)}`,
   ];
 
+  if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
+    sections.push(
+      `Use exactly this SCSS root class name for the component's outermost element: "${getRootClassName(componentName)}".`
+    );
+  }
+
   if (previousCode) {
     sections.push(
       `Current implementation to update:\n${previousCode}`,
       prompt
         ? `Update request from the designer:\n${prompt}`
-        : 'Regenerate the component, keeping it consistent with the original design.',
+        : 'Regenerate the component, keeping it consistent with the original design.'
     );
   } else if (prompt) {
     sections.push(`Additional instructions from the designer:\n${prompt}`);
@@ -270,7 +376,7 @@ async function generateWithAnthropic(
   model: string,
   systemPrompt: string,
   requestText: string,
-  imageBase64?: string,
+  imageBase64?: string
 ): Promise<LlmGenerationResult> {
   const anthropic = new Anthropic({ apiKey });
   const userContent: Anthropic.MessageParam['content'] = [
@@ -293,7 +399,7 @@ async function generateWithAnthropic(
 
   const response = await anthropic.messages.create({
     model,
-    max_tokens: 2000,
+    max_tokens: 20000,
     system: systemPrompt,
     messages: [{ role: 'user', content: userContent }],
   });
@@ -314,7 +420,7 @@ async function generateWithOpenAI(
   model: string,
   systemPrompt: string,
   requestText: string,
-  imageBase64?: string,
+  imageBase64?: string
 ): Promise<LlmGenerationResult> {
   const openai = new OpenAI({ apiKey });
   const content: ResponseInputMessageContentList = [
@@ -357,21 +463,22 @@ app.post('/generate', async (req, res) => {
   const requestId = randomUUID();
 
   try {
-    const { nodeId, componentName, nodeTree, imageBase64, prompt } = req.body;
+    const { nodeId, componentName: rawComponentName, nodeTree, imageBase64, prompt } = req.body;
 
-    if (!componentName || !nodeTree) {
+    if (!rawComponentName || !nodeTree) {
       logEvent('generate.inbound.invalid', {
         requestId,
-        componentName,
+        componentName: rawComponentName,
         nodeId,
       });
 
       return res.status(400).json({ error: 'Missing componentName or nodeTree' });
     }
 
-    const generationKey =
-      typeof nodeId === 'string' && nodeId.trim().length > 0 ? nodeId.trim() : componentName;
-    const previousCode = generatedCodeByKey.get(generationKey);
+    const componentName = sanitizeComponentName(rawComponentName);
+    const { componentDir, componentPath, stylesPath, testPath, storyPath } =
+      getGeneratedComponentPaths(componentName);
+    const previousCode = await readExistingComponentCode(componentPath);
     const isFollowUp = Boolean(previousCode);
     const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
     const systemPrompt = await getSystemPrompt();
@@ -381,8 +488,9 @@ app.post('/generate', async (req, res) => {
     logEvent('generate.inbound.request', {
       requestId,
       nodeId,
+      rawComponentName,
       componentName,
-      generationKey,
+      componentPath,
       prompt: prompt ?? '',
       nodeTree,
       previousCode,
@@ -406,14 +514,14 @@ app.post('/generate', async (req, res) => {
             llmConfig.model,
             systemPrompt,
             requestText,
-            imageBase64,
+            imageBase64
           )
         : await generateWithAnthropic(
             llmConfig.apiKey,
             llmConfig.model,
             systemPrompt,
             requestText,
-            imageBase64,
+            imageBase64
           );
 
     logEvent('generate.inbound.llm_response', {
@@ -424,11 +532,20 @@ app.post('/generate', async (req, res) => {
       componentCode: llmResult.componentCode,
     });
 
-    const componentCode = llmResult.componentCode;
-    generatedCodeByKey.set(generationKey, componentCode);
-    const { componentDir, componentPath, storyPath } = getGeneratedComponentPaths(componentName);
     await fs.mkdir(componentDir, { recursive: true });
-    await fs.writeFile(componentPath, componentCode);
+
+    let componentCode: string;
+
+    if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
+      const files = parseMultiFileResponse(llmResult.rawText);
+      componentCode = files['index.tsx']!;
+      await fs.writeFile(componentPath, componentCode);
+      await fs.writeFile(stylesPath!, files['styles.scss']!);
+      await fs.writeFile(testPath!, files['index.test.tsx']!);
+    } else {
+      componentCode = llmResult.componentCode;
+      await fs.writeFile(componentPath, componentCode);
+    }
 
     try {
       await fs.access(storyPath);
@@ -443,6 +560,8 @@ app.post('/generate', async (req, res) => {
       requestId,
       responseBody,
       componentPath,
+      stylesPath,
+      testPath,
       storyPath,
     });
     res.json(responseBody);
@@ -490,7 +609,9 @@ app.get('/healthz', async (_req, res) => {
     res.json({ status: 'ok', provider: llmConfig.provider, model: llmConfig.model });
   } catch (error) {
     if (error instanceof LlmConfigurationError) {
-      return res.status(200).json({ status: 'ok', provider: null, model: null, detail: error.message });
+      return res
+        .status(200)
+        .json({ status: 'ok', provider: null, model: null, detail: error.message });
     }
 
     if (error instanceof PromptConfigurationError) {

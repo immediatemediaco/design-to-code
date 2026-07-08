@@ -1,0 +1,7 @@
+Child component composition:
+
+- The Figma plugin walks the current selection and generates component-like descendants (frames, components, instances, groups that have their own children) as separate, atomic components before generating the one you're currently asked for. Leaf content (text, vectors, plain shapes) is never split out this way — it stays inline as part of whichever component contains it.
+- When a node in the provided `nodeTree` has `"type": "GENERATED_COMPONENT_REF"` instead of a real Figma node type, it means that child was already generated in this same run as its own component, sitting at `packages/components/src/generated/<generatedComponentName>/`, a sibling directory to the one you're writing now.
+- Treat that reference as an instruction to compose, not a gap to fill in: import it from the sibling directory (e.g. `import ChildName from '../ChildName/index.jsx';`) and render it in place, rather than reimplementing its internal structure. Its `name`/`width`/`height` fields on the reference are layout hints for sizing/placement only.
+- A `GENERATED_COMPONENT_REF` will never appear at the top level of the tree you're generating — only nested inside `children`. The top-level node is always the real component you're generating right now.
+- If a child failed to generate (the plugin still attempts the rest of the tree when one step fails), it simply won't appear as a `GENERATED_COMPONENT_REF` and its subtree will be inlined as normal Figma node data instead — treat it the same as any other nested structure in that case.

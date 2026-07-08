@@ -1,6 +1,6 @@
 Token and theme discipline:
 
-- Prefer semantic token usage and theme-aware structure whenever the provided context supports it.
+- Style every generated component through its `styles.scss` file, using only the `$color--*` / `spacing-unit()` token names listed in the styling-and-tokens facts. This is the default expectation, not an optional enhancement — an unstyled component is a failure, not a safe fallback.
 - Do not hardcode a brand name or add brand-specific conditionals inside the generated component.
-- Do not invent token names just because a screenshot suggests a value. If the mapping is missing, preserve the gap explicitly instead of fabricating repo-specific token names.
+- Do not invent token names that are not in the provided list just because a screenshot suggests a value. "Preserving the gap" means choosing the closest real token — preferring a bound Figma variable's name over a guess when one was provided — and, if truly nothing fits, falling back to a literal value. It does not mean leaving the element unstyled or emitting a `className` with no backing `styles.scss` rule.
 - If you must fall back to a literal value because no verified token mapping was provided, keep that fallback local and obvious rather than presenting it as an established repo convention.

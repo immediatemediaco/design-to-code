@@ -31,3 +31,10 @@ services:
       GENERATED_COMPONENT_FORMAT: patchwork
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  nginx:
+    volumes:
+      - type: bind
+        source: ./docker/nginx-timeouts.conf
+        target: /etc/nginx/conf.d/00-timeouts.conf
+        read_only: true

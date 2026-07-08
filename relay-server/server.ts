@@ -2,6 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs/promises';
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
+import { promises as dns } from 'node:dns';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -9,6 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
+import { chromium } from 'playwright';
 import type {
   ResponseInputImage,
   ResponseInputMessageContentList,
@@ -51,6 +55,9 @@ const INDEX_CSS_PATH = process.env.STORYBOOK_INDEX_CSS_PATH
 const PROMPTS_DIR = path.resolve(process.env.PROMPTS_DIR ?? path.resolve(__dirname, '../prompts'));
 const PROMPT_FACTS_DIR = 'facts';
 const PROMPT_GUARDS_DIR = 'guards';
+const PATCHWORK_ROOT = path.resolve(
+  process.env.PATCHWORK_ROOT ?? path.resolve(__dirname, '../patchwork')
+);
 const SYSTEM_PROMPT_ENTRYPOINT = process.env.SYSTEM_PROMPT_FILE ?? 'import.md';
 
 const DEFAULT_MODEL_BY_PROVIDER = {
@@ -331,9 +338,9 @@ async function getPromptContent(relativePath: string) {
   return [...factContent, ...guardContent, promptBody].filter(Boolean).join('\n\n').trim();
 }
 
-async function getSystemPrompt() {
+async function getSystemPrompt(entrypoint: string = SYSTEM_PROMPT_ENTRYPOINT) {
   try {
-    return await getPromptContent(SYSTEM_PROMPT_ENTRYPOINT);
+    return await getPromptContent(entrypoint);
   } catch (error) {
     if (error instanceof PromptConfigurationError) {
       throw error;
@@ -415,7 +422,7 @@ async function generateWithAnthropic(
   model: string,
   systemPrompt: string,
   requestText: string,
-  imageBase64?: string
+  images: string[] = []
 ): Promise<LlmGenerationResult> {
   const anthropic = new Anthropic({ apiKey });
   const userContent: Anthropic.MessageParam['content'] = [
@@ -425,7 +432,7 @@ async function generateWithAnthropic(
     },
   ];
 
-  if (imageBase64) {
+  for (const imageBase64 of images) {
     userContent.push({
       type: 'image',
       source: {
@@ -459,7 +466,7 @@ async function generateWithOpenAI(
   model: string,
   systemPrompt: string,
   requestText: string,
-  imageBase64?: string
+  images: string[] = []
 ): Promise<LlmGenerationResult> {
   const openai = new OpenAI({ apiKey });
   const content: ResponseInputMessageContentList = [
@@ -469,7 +476,7 @@ async function generateWithOpenAI(
     } satisfies ResponseInputText,
   ];
 
-  if (imageBase64) {
+  for (const imageBase64 of images) {
     content.push({
       type: 'input_image',
       image_url: `data:image/png;base64,${imageBase64}`,
@@ -496,6 +503,273 @@ async function generateWithOpenAI(
     rawText: response.output_text,
     componentCode: extractCode(response.output_text),
   };
+}
+
+const STORYBOOK_TARGET = process.env.STORYBOOK_TARGET ?? 'http://app:9000';
+const VISUAL_CHECK_TIMEOUT_MS = Number(process.env.VISUAL_CHECK_TIMEOUT_MS ?? 45000);
+
+/**
+ * Storybook assigns each story an id from its title/name that isn't worth
+ * reimplementing (it's a "toId" slugify with its own edge cases) — instead,
+ * poll Storybook's own index until it lists a "Default" story whose
+ * importPath matches the file we just wrote, and read the id back from there.
+ * Polling also absorbs the webpack/styles rebuild latency after a fresh write.
+ */
+async function findDefaultStoryId(componentDir: string): Promise<string | undefined> {
+  const componentsSrcRoot = path.join(PATCHWORK_ROOT, 'packages/components/src');
+  const expectedImportPath = `../components/src/${path
+    .relative(componentsSrcRoot, path.join(componentDir, 'stories.tsx'))
+    .split(path.sep)
+    .join('/')}`;
+
+  const deadline = Date.now() + VISUAL_CHECK_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${STORYBOOK_TARGET}/index.json`);
+      if (response.ok) {
+        const index = (await response.json()) as { entries?: Record<string, unknown> };
+        const entry = Object.values(index.entries ?? {}).find(
+          (candidate): candidate is { id: string; importPath: string; type: string; name: string } =>
+            typeof candidate === 'object'
+            && candidate !== null
+            && (candidate as { importPath?: unknown }).importPath === expectedImportPath
+            && (candidate as { type?: unknown }).type === 'story'
+            && (candidate as { name?: unknown }).name === 'Default'
+        );
+
+        if (entry) {
+          return entry.id;
+        }
+      }
+    } catch {
+      // keep polling — the app container's dev server may still be mid-rebuild
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  return undefined;
+}
+
+/**
+ * Best-effort — a failure here (browser launch, navigation timeout) just
+ * means the visual-correction step is skipped for this request, not a reason
+ * to fail a generation that already succeeded and was written to disk.
+ */
+/**
+ * Chromium silently upgrades navigation to bare single-label hostnames (like
+ * the Docker service name "app") to HTTPS, which fails against our plain-HTTP
+ * dev server with a TLS error — plain fetch() doesn't have this quirk, only
+ * browser navigation does. Resolving to the IP ourselves sidesteps it.
+ */
+async function resolveTargetForBrowser(target: string): Promise<string> {
+  const url = new URL(target);
+  try {
+    const { address } = await dns.lookup(url.hostname);
+    url.hostname = address;
+  } catch {
+    // Fall back to the original hostname if lookup fails for some reason.
+  }
+  return url.toString().replace(/\/$/, '');
+}
+
+async function captureStoryScreenshot(storyId: string): Promise<string | undefined> {
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+
+  try {
+    const browserTarget = await resolveTargetForBrowser(STORYBOOK_TARGET);
+    browser = await chromium.launch();
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    // Not 'networkidle': Storybook's dev server keeps a persistent HMR
+    // websocket open, so the page never goes network-idle and that wait
+    // condition just times out every time.
+    await page.goto(`${browserTarget}/iframe.html?id=${storyId}&viewMode=story`, {
+      waitUntil: 'load',
+      timeout: 20000,
+    });
+
+    const root = page.locator('#storybook-root');
+    await root.waitFor({ state: 'attached', timeout: 10000 });
+    // Settle beyond first paint for style/font application to finish.
+    await page.waitForTimeout(500);
+
+    const target = (await root.count()) > 0 ? root : page;
+    const screenshotBuffer = await target.screenshot();
+    return screenshotBuffer.toString('base64');
+  } catch (error) {
+    logEvent('generate.visual_check.screenshot_error', {
+      storyId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  } finally {
+    await browser?.close().catch(() => undefined);
+  }
+}
+
+type VisualCorrectionResult = { checked: boolean; corrected: boolean; reason?: string };
+
+/**
+ * Renders the just-written component in the real running Storybook, compares
+ * it against the original Figma screenshot, and — if the model finds a real
+ * discrepancy — overwrites the four files with its correction. Skipped
+ * entirely (not an error) when there's no original screenshot to compare
+ * against, since there'd be nothing to diff.
+ */
+async function runVisualCorrection(params: {
+  componentName: string;
+  componentDir: string;
+  originalImageBase64: string | undefined;
+  llmConfig: { provider: LlmProvider; apiKey: string; model: string };
+}): Promise<VisualCorrectionResult> {
+  const { componentName, componentDir, originalImageBase64, llmConfig } = params;
+
+  if (!originalImageBase64) {
+    return { checked: false, corrected: false, reason: 'No original Figma screenshot to compare against' };
+  }
+
+  const storyId = await findDefaultStoryId(componentDir);
+  if (!storyId) {
+    return { checked: false, corrected: false, reason: 'Story did not appear in Storybook in time' };
+  }
+
+  const storybookScreenshot = await captureStoryScreenshot(storyId);
+  if (!storybookScreenshot) {
+    return { checked: false, corrected: false, reason: 'Could not capture a Storybook screenshot' };
+  }
+
+  const paths = getGeneratedComponentPaths(componentDir);
+  const [componentCode, stylesCode, storyCode, testCode] = await Promise.all([
+    fs.readFile(paths.componentPath, 'utf-8'),
+    fs.readFile(paths.stylesPath, 'utf-8'),
+    fs.readFile(paths.storyPath, 'utf-8'),
+    fs.readFile(paths.testPath, 'utf-8'),
+  ]);
+
+  const requestText = [
+    `Component: ${componentName}`,
+    `Image 1: the original Figma screenshot (reference).`,
+    `Image 2: how the component currently renders in Storybook.`,
+    `### FILE: index.tsx\n\`\`\`tsx\n${componentCode}\n\`\`\``,
+    `### FILE: styles.scss\n\`\`\`scss\n${stylesCode}\n\`\`\``,
+    `### FILE: stories.tsx\n\`\`\`tsx\n${storyCode}\n\`\`\``,
+    `### FILE: index.test.tsx\n\`\`\`tsx\n${testCode}\n\`\`\``,
+  ].join('\n\n');
+
+  const systemPrompt = await getSystemPrompt('visual-correction.md');
+  const images = [originalImageBase64, storybookScreenshot];
+
+  const llmResult =
+    llmConfig.provider === 'openai'
+      ? await generateWithOpenAI(llmConfig.apiKey, llmConfig.model, systemPrompt, requestText, images)
+      : await generateWithAnthropic(llmConfig.apiKey, llmConfig.model, systemPrompt, requestText, images);
+
+  const { files } = parseMultiFileResponse(llmResult.rawText);
+  const changed =
+    files['index.tsx'] !== componentCode
+    || files['styles.scss'] !== stylesCode
+    || files['stories.tsx'] !== storyCode
+    || files['index.test.tsx'] !== testCode;
+
+  if (!changed) {
+    return { checked: true, corrected: false };
+  }
+
+  await fs.writeFile(paths.componentPath, files['index.tsx']!);
+  await fs.writeFile(paths.stylesPath, files['styles.scss']!);
+  await fs.writeFile(paths.storyPath, files['stories.tsx']!);
+  await fs.writeFile(paths.testPath, files['index.test.tsx']!);
+
+  return { checked: true, corrected: true };
+}
+
+function runGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+        return;
+      }
+
+      reject(new Error(`git ${args.join(' ')} failed (exit ${code}): ${(stderr || stdout).trim()}`));
+    });
+  });
+}
+
+async function remoteBranchExists(branchName: string): Promise<boolean> {
+  try {
+    const output = await runGit(['ls-remote', '--heads', 'origin', branchName], PATCHWORK_ROOT);
+    return output.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+type GitPushResult = { pushed: true; branch: string } | { pushed: false; error: string };
+
+/**
+ * Commits and pushes just the files this request wrote, to a branch named
+ * after the component (shared across follow-ups so they accumulate as
+ * commits on one branch, like a person iterating on a feature). Runs in a
+ * throwaway `git worktree` rather than the main bind-mounted checkout, so it
+ * never changes which branch is checked out in the patchwork/ directory
+ * developers and other containers actually see.
+ */
+async function commitAndPushGeneratedComponent(
+  componentName: string,
+  filePaths: string[],
+  isFollowUp: boolean
+): Promise<GitPushResult> {
+  const branchName = `design-to-code/${kebabCase(componentName)}`;
+  const worktreeDir = path.join(os.tmpdir(), `patchwork-push-${randomUUID()}`);
+
+  try {
+    await runGit(['fetch', 'origin', branchName], PATCHWORK_ROOT).catch(() => undefined);
+    const baseRef = (await remoteBranchExists(branchName)) ? `origin/${branchName}` : 'HEAD';
+
+    await runGit(['worktree', 'add', '--detach', worktreeDir, baseRef], PATCHWORK_ROOT);
+    await runGit(['checkout', '-B', branchName], worktreeDir);
+
+    const relativePaths: string[] = [];
+    for (const filePath of filePaths) {
+      const relativePath = path.relative(PATCHWORK_ROOT, filePath);
+      await fs.mkdir(path.dirname(path.join(worktreeDir, relativePath)), { recursive: true });
+      await fs.copyFile(filePath, path.join(worktreeDir, relativePath));
+      relativePaths.push(relativePath);
+    }
+
+    await runGit(['add', ...relativePaths], worktreeDir);
+
+    const statusOutput = await runGit(['status', '--porcelain'], worktreeDir);
+    if (!statusOutput.trim()) {
+      return { pushed: false, error: 'No changes to commit (output was identical to the last commit)' };
+    }
+
+    const commitMessage = isFollowUp
+      ? `Update ${componentName} via design-to-code`
+      : `Add ${componentName} via design-to-code`;
+    await runGit(['commit', '-m', commitMessage], worktreeDir);
+    await runGit(['push', '-u', 'origin', `HEAD:${branchName}`], worktreeDir);
+
+    return { pushed: true, branch: branchName };
+  } catch (error) {
+    return { pushed: false, error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    await runGit(['worktree', 'remove', worktreeDir, '--force'], PATCHWORK_ROOT).catch(() => undefined);
+  }
 }
 
 app.post('/generate', async (req, res) => {
@@ -559,6 +833,7 @@ app.post('/generate', async (req, res) => {
       ...imageSummary,
     });
 
+    const requestImages = imageBase64 ? [imageBase64] : [];
     const llmResult =
       llmConfig.provider === 'openai'
         ? await generateWithOpenAI(
@@ -566,14 +841,14 @@ app.post('/generate', async (req, res) => {
             llmConfig.model,
             systemPrompt,
             requestText,
-            imageBase64
+            requestImages
           )
         : await generateWithAnthropic(
             llmConfig.apiKey,
             llmConfig.model,
             systemPrompt,
             requestText,
-            imageBase64
+            requestImages
           );
 
     logEvent('generate.inbound.llm_response', {
@@ -588,6 +863,7 @@ app.post('/generate', async (req, res) => {
     let atomicLevelFolder: string | undefined;
     let componentDir: string;
     let componentPath: string;
+    let generatedFilePaths: string[] = [];
 
     if (isPatchwork) {
       const { atomicLevel, files } = parseMultiFileResponse(llmResult.rawText);
@@ -603,6 +879,8 @@ app.post('/generate', async (req, res) => {
       await fs.writeFile(paths.stylesPath, files['styles.scss']!);
       await fs.writeFile(paths.storyPath, files['stories.tsx']!);
       await fs.writeFile(paths.testPath, files['index.test.tsx']!);
+
+      generatedFilePaths = [componentPath, paths.stylesPath, paths.storyPath, paths.testPath];
     } else {
       componentDir = GENERATED_DIR;
       componentPath = legacyComponentPath;
@@ -621,12 +899,55 @@ app.post('/generate', async (req, res) => {
 
     await touchReloadFile();
 
+    // Best-effort, same philosophy as the git step below: render what was
+    // just written in the real Storybook, compare against the original
+    // Figma screenshot, and correct the files in place if the model finds a
+    // genuine discrepancy — before committing, so the commit reflects the
+    // corrected version rather than needing a separate follow-up commit.
+    const visualCheck =
+      isPatchwork && generatedFilePaths.length > 0
+        ? await runVisualCorrection({
+            componentName,
+            componentDir,
+            originalImageBase64: imageBase64,
+            llmConfig,
+          }).catch((error) => {
+            logEvent('generate.visual_check.error', {
+              requestId,
+              componentName,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return { checked: false, corrected: false, reason: 'Visual check failed unexpectedly' };
+          })
+        : undefined;
+
+    // Best-effort: the component is already fully generated and written at
+    // this point regardless of what happens here, so a git failure (no
+    // credentials, network down, a genuine conflict) is reported alongside a
+    // still-successful response rather than turned into a 500.
+    const gitResult =
+      isPatchwork && generatedFilePaths.length > 0
+        ? await commitAndPushGeneratedComponent(componentName, generatedFilePaths, isFollowUp)
+        : undefined;
+
+    if (gitResult && !gitResult.pushed) {
+      logEvent('generate.git.error', { requestId, componentName, error: gitResult.error });
+    }
+
+    // The response should reflect the corrected code, not the pre-correction
+    // version captured before the visual check ran.
+    if (visualCheck?.corrected) {
+      componentCode = await fs.readFile(componentPath, 'utf-8');
+    }
+
     const responseBody = {
       status: 'ok',
       componentName,
       code: componentCode,
       isFollowUp,
       atomicLevel: atomicLevelFolder,
+      visualCheck,
+      git: gitResult,
     };
     logEvent('generate.outbound.response', {
       requestId,

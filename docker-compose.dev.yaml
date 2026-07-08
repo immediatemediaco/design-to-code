@@ -24,6 +24,10 @@ services:
       - ./prompts:/workspace/prompts:rw,cached
       - ./patchwork:/workspace/patchwork:rw,cached
       - relay_server_node_modules:/workspace/relay-server/node_modules
+      # For auto-committing/pushing generated changes: reuses your own SSH
+      # key + git identity rather than provisioning a separate bot credential.
+      - ~/.ssh:/root/.ssh:ro
+      - ~/.gitconfig:/root/.gitconfig:ro
 
 volumes:
   patchwork_node_modules:

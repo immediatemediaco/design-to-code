@@ -29,6 +29,7 @@ services:
       PORT: 4000
       GENERATED_DIR: /workspace/patchwork/packages/components/src/generated
       GENERATED_COMPONENT_FORMAT: patchwork
+      PATCHWORK_ROOT: /workspace/patchwork
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

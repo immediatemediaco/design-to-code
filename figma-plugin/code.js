@@ -45,6 +45,59 @@ async function resolveBoundVariables(node) {
     }
     return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
+function stripPropertyId(propertyName) {
+    // Figma suffixes BOOLEAN/TEXT/INSTANCE_SWAP property names with '#<id>' to
+    // disambiguate them internally — meaningless to the model, strip it.
+    return propertyName.replace(/#.*$/, '');
+}
+/**
+ * If this node is a component variant (or an instance of one), surface its
+ * variant/boolean/text/instance-swap property axes and their possible values
+ * — e.g. a "State" axis with options ["Default","Hover","Disabled"] — from
+ * just the single selected node, without needing every sibling variant sent
+ * separately. This is what lets the model decide a Figma variant set should
+ * become one component with a prop instead of a separate component per state.
+ */
+async function getVariantContext(node) {
+    var _a;
+    try {
+        const instanceNode = node.type === 'INSTANCE' ? node : undefined;
+        const componentNode = node.type === 'COMPONENT' ? node : await (instanceNode === null || instanceNode === void 0 ? void 0 : instanceNode.getMainComponentAsync());
+        if (!componentNode) {
+            return undefined;
+        }
+        const componentSet = ((_a = componentNode.parent) === null || _a === void 0 ? void 0 : _a.type) === 'COMPONENT_SET' ? componentNode.parent : undefined;
+        // Figma throws synchronously here (rather than returning empty/null) when the
+        // underlying component set has validation errors of its own — this data is
+        // purely a best-effort enrichment, so any failure just means "none available",
+        // not a reason to fail the whole generation task.
+        const definitions = (componentSet !== null && componentSet !== void 0 ? componentSet : componentNode).componentPropertyDefinitions;
+        const currentValues = {};
+        if (instanceNode) {
+            for (const [key, prop] of Object.entries(instanceNode.componentProperties)) {
+                currentValues[stripPropertyId(key)] = prop.value;
+            }
+        }
+        else if (componentNode.variantProperties) {
+            Object.assign(currentValues, componentNode.variantProperties);
+        }
+        const availableProperties = {};
+        for (const [key, definition] of Object.entries(definitions !== null && definitions !== void 0 ? definitions : {})) {
+            availableProperties[stripPropertyId(key)] = {
+                type: definition.type,
+                options: definition.variantOptions,
+                defaultValue: definition.defaultValue,
+            };
+        }
+        if (Object.keys(currentValues).length === 0 && Object.keys(availableProperties).length === 0) {
+            return undefined;
+        }
+        return { currentValues, availableProperties };
+    }
+    catch (_b) {
+        return undefined;
+    }
+}
 /**
  * A node is worth generating as its own atomic Patchwork component when it's
  * a container type that can meaningfully hold structure of its own. Plain
@@ -180,6 +233,12 @@ async function serializeNode(node, generatedChildNames) {
     const boundVariables = await resolveBoundVariables(node);
     if (boundVariables) {
         base.boundVariables = boundVariables;
+    }
+    if (node.type === 'COMPONENT' || node.type === 'INSTANCE') {
+        const variantContext = await getVariantContext(node);
+        if (variantContext) {
+            base.variantContext = variantContext;
+        }
     }
     if ('children' in node) {
         base.children = await Promise.all(node.children.map(async (child) => {

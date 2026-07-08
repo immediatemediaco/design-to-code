@@ -93,21 +93,22 @@
       };
 
       // The plugin predicts each task's componentName before any network call
-      // (it can't know the relay's sanitization rules), but the relay is the
-      // one that actually decides the final, on-disk name (e.g. "Span&Ticker"
-      // becomes "SpanTicker"). If a child's real name differs from what was
-      // predicted, every later task whose nodeTree references that child via
-      // GENERATED_COMPONENT_REF needs patching, or the parent ends up
-      // importing a path that was never actually written.
-      function patchGeneratedRefs(node, fromName, toName) {
+      // (it can't know the relay's sanitization rules, or which atomic-level
+      // folder the relay will classify/place it in), but the relay decides
+      // both for real — e.g. "Span&Ticker" becomes "SpanTicker" in "atoms".
+      // Every later task whose nodeTree references this child via
+      // GENERATED_COMPONENT_REF needs patching with the real values, or the
+      // parent ends up importing a path that was never actually written.
+      function patchGeneratedRefs(node, fromName, toName, atomicLevel) {
         if (!node || typeof node !== 'object') return;
 
         if (node.type === 'GENERATED_COMPONENT_REF' && node.generatedComponentName === fromName) {
           node.generatedComponentName = toName;
+          node.generatedAtomicLevel = atomicLevel;
         }
 
         if (Array.isArray(node.children)) {
-          node.children.forEach((child) => patchGeneratedRefs(child, fromName, toName));
+          node.children.forEach((child) => patchGeneratedRefs(child, fromName, toName, atomicLevel));
         }
       }
 
@@ -134,7 +135,7 @@
               'assistant',
               data.isFollowUp ? `Updated ${data.componentName}.` : `Generated ${data.componentName}.`
             );
-            return { ok: true, componentName: data.componentName };
+            return { ok: true, componentName: data.componentName, atomicLevel: data.atomicLevel };
           }
 
           statusEl.textContent = data.detail ?? data.error ?? 'Generation failed';
@@ -175,9 +176,11 @@
             // (final) task gets it.
             const result = await generateTask(task, { prompt: isRootTask ? prompt : undefined, label });
 
-            if (result.ok && result.componentName !== task.componentName) {
+            // Always patch, not just on a name change — generatedAtomicLevel
+            // starts out unknown for every task and is only ever learned here.
+            if (result.ok) {
               for (let j = i + 1; j < tasks.length; j += 1) {
-                patchGeneratedRefs(tasks[j].nodeTree, task.componentName, result.componentName);
+                patchGeneratedRefs(tasks[j].nodeTree, task.componentName, result.componentName, result.atomicLevel);
               }
             }
           }

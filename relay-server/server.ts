@@ -120,26 +120,55 @@ function getRootClassName(componentName: string) {
   return `generated-${kebabCase(componentName)}`;
 }
 
-function getGeneratedComponentPaths(componentName: string) {
-  if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
-    const componentDir = path.join(GENERATED_DIR, componentName);
+const ATOMIC_LEVEL_FOLDERS = {
+  atom: 'atoms',
+  molecule: 'molecules',
+  organism: 'organisms',
+} as const;
+type AtomicLevel = keyof typeof ATOMIC_LEVEL_FOLDERS;
+const ATOMIC_LEVEL_BY_FOLDER: Record<string, AtomicLevel> = Object.fromEntries(
+  Object.entries(ATOMIC_LEVEL_FOLDERS).map(([level, folder]) => [folder, level as AtomicLevel])
+);
 
-    return {
-      componentDir,
-      componentPath: path.join(componentDir, 'index.tsx'),
-      stylesPath: path.join(componentDir, 'styles.scss'),
-      testPath: path.join(componentDir, 'index.test.tsx'),
-      storyPath: path.join(componentDir, 'stories.tsx'),
-    };
+function getGeneratedComponentPaths(componentDir: string) {
+  return {
+    componentDir,
+    componentPath: path.join(componentDir, 'index.tsx'),
+    stylesPath: path.join(componentDir, 'styles.scss'),
+    testPath: path.join(componentDir, 'index.test.tsx'),
+    storyPath: path.join(componentDir, 'stories.tsx'),
+  };
+}
+
+/**
+ * A component's folder is decided once, the first time it's generated, and
+ * never moves after that — otherwise a follow-up reclassifying "atom" to
+ * "molecule" would silently orphan the original files (and anything that
+ * already imports them via the atomic-level-aware @generated alias). This
+ * also covers components generated before atomic subfolders existed, sitting
+ * flat directly under generated/.
+ */
+async function findExistingComponentDir(
+  componentName: string
+): Promise<{ componentDir: string; atomicLevelFolder: string | undefined } | undefined> {
+  const candidates: Array<{ componentDir: string; atomicLevelFolder: string | undefined }> = [
+    { componentDir: path.join(GENERATED_DIR, componentName), atomicLevelFolder: undefined },
+    ...Object.values(ATOMIC_LEVEL_FOLDERS).map((folder) => ({
+      componentDir: path.join(GENERATED_DIR, folder, componentName),
+      atomicLevelFolder: folder,
+    })),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(path.join(candidate.componentDir, 'index.tsx'));
+      return candidate;
+    } catch {
+      // not this one
+    }
   }
 
-  return {
-    componentDir: GENERATED_DIR,
-    componentPath: path.join(GENERATED_DIR, `${componentName}.tsx`),
-    stylesPath: undefined,
-    testPath: undefined,
-    storyPath: path.join(GENERATED_DIR, `${componentName}.stories.tsx`),
-  };
+  return undefined;
 }
 
 /**
@@ -157,15 +186,28 @@ async function readExistingComponentCode(componentPath: string): Promise<string 
   }
 }
 
-const PATCHWORK_OUTPUT_FILES = ['index.tsx', 'styles.scss', 'index.test.tsx'] as const;
+const PATCHWORK_OUTPUT_FILES = ['index.tsx', 'styles.scss', 'stories.tsx', 'index.test.tsx'] as const;
 
 /**
- * The patchwork format needs three files out of one LLM response (component,
- * SCSS, test). Require an explicit `### FILE: <name>` + fenced-block-per-file
- * shape (mandated by the output-shape guard prompt) rather than guessing at
- * boundaries from a single blob of code.
+ * The patchwork format needs an atomic-level classification plus four files
+ * out of one LLM response (component, SCSS, story, test). Require an
+ * explicit `### ATOMIC_LEVEL: x` header and `### FILE: <name>` +
+ * fenced-block-per-file shape (mandated by the output-shape guard prompt)
+ * rather than guessing at boundaries from a single blob of code.
  */
-function parseMultiFileResponse(responseText: string): Record<string, string> {
+function parseMultiFileResponse(responseText: string): {
+  atomicLevel: AtomicLevel;
+  files: Record<string, string>;
+} {
+  const levelMatch = responseText.match(/###\s*ATOMIC_LEVEL:\s*(atom|molecule|organism)\b/i);
+  if (!levelMatch) {
+    throw new Error(
+      'Model response did not include a valid "### ATOMIC_LEVEL: atom|molecule|organism" header'
+    );
+  }
+
+  const atomicLevel = levelMatch[1]!.toLowerCase() as AtomicLevel;
+
   // Tolerate a blank line (or more) between the "### FILE:" header and the
   // opening fence — models routinely add one as natural markdown formatting,
   // and requiring them adjacent caused every file to go "missing" at once.
@@ -185,23 +227,13 @@ function parseMultiFileResponse(responseText: string): Record<string, string> {
     );
   }
 
-  return files;
+  return { atomicLevel, files };
 }
 
+// Only used for the legacy sandbox format. In patchwork format, stories.tsx
+// is one of the four files the model generates itself (see
+// PATCHWORK_OUTPUT_FILES) so it can define real Controls/argTypes.
 function getStoryCode(componentName: string) {
-  if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
-    return `import React from 'react';
-import ${componentName} from './index.jsx';
-
-export default {
-  title: 'Generated/${componentName}',
-  component: ${componentName},
-};
-
-export const Default = () => <${componentName} />;
-`;
-  }
-
   return `import ${componentName} from './${componentName}'
 
 export default { title: 'Generated/${componentName}', component: ${componentName} };
@@ -344,7 +376,8 @@ function buildGenerationPrompt(
   componentName: string,
   nodeTree: unknown,
   prompt: string | undefined,
-  previousCode: string | undefined
+  previousCode: string | undefined,
+  existingAtomicLevel: AtomicLevel | undefined
 ) {
   const sections = [
     `Generate a React component named "${componentName}".`,
@@ -355,6 +388,12 @@ function buildGenerationPrompt(
     sections.push(
       `Use exactly this SCSS root class name for the component's outermost element: "${getRootClassName(componentName)}".`
     );
+
+    if (existingAtomicLevel) {
+      sections.push(
+        `This component was previously classified as a(n) ${existingAtomicLevel}. It will be written back to that same folder regardless of what you output this time — keep your ATOMIC_LEVEL consistent with that unless the design has fundamentally changed shape, and if it has, say so explicitly rather than silently reclassifying it.`
+      );
+    }
   }
 
   if (previousCode) {
@@ -476,11 +515,24 @@ app.post('/generate', async (req, res) => {
     }
 
     const componentName = sanitizeComponentName(rawComponentName);
-    const { componentDir, componentPath, stylesPath, testPath, storyPath } =
-      getGeneratedComponentPaths(componentName);
-    const previousCode = await readExistingComponentCode(componentPath);
+    const isPatchwork = GENERATED_COMPONENT_FORMAT === 'patchwork';
+
+    const existing = isPatchwork ? await findExistingComponentDir(componentName) : undefined;
+    const existingAtomicLevel = existing?.atomicLevelFolder
+      ? ATOMIC_LEVEL_BY_FOLDER[existing.atomicLevelFolder]
+      : undefined;
+    const legacyComponentPath = path.join(GENERATED_DIR, `${componentName}.tsx`);
+    const previousCode = await readExistingComponentCode(
+      isPatchwork ? path.join(existing?.componentDir ?? '', 'index.tsx') : legacyComponentPath
+    );
     const isFollowUp = Boolean(previousCode);
-    const requestText = buildGenerationPrompt(componentName, nodeTree, prompt, previousCode);
+    const requestText = buildGenerationPrompt(
+      componentName,
+      nodeTree,
+      prompt,
+      previousCode,
+      existingAtomicLevel
+    );
     const systemPrompt = await getSystemPrompt();
     const llmConfig = await resolveLlmConfig();
     const imageSummary = getImageSummary(imageBase64);
@@ -490,7 +542,7 @@ app.post('/generate', async (req, res) => {
       nodeId,
       rawComponentName,
       componentName,
-      componentPath,
+      existingComponentDir: existing?.componentDir,
       prompt: prompt ?? '',
       nodeTree,
       previousCode,
@@ -532,37 +584,55 @@ app.post('/generate', async (req, res) => {
       componentCode: llmResult.componentCode,
     });
 
-    await fs.mkdir(componentDir, { recursive: true });
-
     let componentCode: string;
+    let atomicLevelFolder: string | undefined;
+    let componentDir: string;
+    let componentPath: string;
 
-    if (GENERATED_COMPONENT_FORMAT === 'patchwork') {
-      const files = parseMultiFileResponse(llmResult.rawText);
+    if (isPatchwork) {
+      const { atomicLevel, files } = parseMultiFileResponse(llmResult.rawText);
+      atomicLevelFolder = existing?.atomicLevelFolder ?? ATOMIC_LEVEL_FOLDERS[atomicLevel];
+      componentDir = existing?.componentDir ?? path.join(GENERATED_DIR, atomicLevelFolder, componentName);
+
+      const paths = getGeneratedComponentPaths(componentDir);
+      componentPath = paths.componentPath;
       componentCode = files['index.tsx']!;
-      await fs.writeFile(componentPath, componentCode);
-      await fs.writeFile(stylesPath!, files['styles.scss']!);
-      await fs.writeFile(testPath!, files['index.test.tsx']!);
-    } else {
-      componentCode = llmResult.componentCode;
-      await fs.writeFile(componentPath, componentCode);
-    }
 
-    try {
-      await fs.access(storyPath);
-    } catch {
-      await fs.writeFile(storyPath, getStoryCode(componentName));
+      await fs.mkdir(componentDir, { recursive: true });
+      await fs.writeFile(componentPath, componentCode);
+      await fs.writeFile(paths.stylesPath, files['styles.scss']!);
+      await fs.writeFile(paths.storyPath, files['stories.tsx']!);
+      await fs.writeFile(paths.testPath, files['index.test.tsx']!);
+    } else {
+      componentDir = GENERATED_DIR;
+      componentPath = legacyComponentPath;
+      componentCode = llmResult.componentCode;
+      const storyPath = path.join(GENERATED_DIR, `${componentName}.stories.tsx`);
+
+      await fs.mkdir(componentDir, { recursive: true });
+      await fs.writeFile(componentPath, componentCode);
+
+      try {
+        await fs.access(storyPath);
+      } catch {
+        await fs.writeFile(storyPath, getStoryCode(componentName));
+      }
     }
 
     await touchReloadFile();
 
-    const responseBody = { status: 'ok', componentName, code: componentCode, isFollowUp };
+    const responseBody = {
+      status: 'ok',
+      componentName,
+      code: componentCode,
+      isFollowUp,
+      atomicLevel: atomicLevelFolder,
+    };
     logEvent('generate.outbound.response', {
       requestId,
       responseBody,
+      componentDir,
       componentPath,
-      stylesPath,
-      testPath,
-      storyPath,
     });
     res.json(responseBody);
   } catch (err) {

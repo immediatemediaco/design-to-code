@@ -186,9 +186,11 @@ function serializeEffect(effect: Effect): any {
   return undefined;
 }
 
+type GeneratedChildInfo = { componentName: string; atomicLevel?: string };
+
 async function serializeNode(
   node: SceneNode,
-  generatedChildNames?: Map<string, string>,
+  generatedChildNames?: Map<string, GeneratedChildInfo>,
 ): Promise<any> {
   const base: any = {
     type: node.type,
@@ -301,16 +303,19 @@ async function serializeNode(
   if ('children' in node) {
     base.children = await Promise.all(
       (node as unknown as { children: SceneNode[] }).children.map(async (child) => {
-        const generatedComponentName = generatedChildNames?.get(child.id);
+        const generatedChildInfo = generatedChildNames?.get(child.id);
 
         // This child was already generated as its own atomic Patchwork
         // component in an earlier step of this same generation run — point
         // at it instead of re-describing its whole subtree inline, so the
-        // model composes it rather than reimplementing it.
-        if (generatedComponentName) {
+        // model composes it rather than reimplementing it. atomicLevel isn't
+        // known yet at this point (the child's own relay call hasn't run) —
+        // ui.html patches it in once that response comes back, same as name.
+        if (generatedChildInfo) {
           return {
             type: 'GENERATED_COMPONENT_REF',
-            generatedComponentName,
+            generatedComponentName: generatedChildInfo.componentName,
+            generatedAtomicLevel: generatedChildInfo.atomicLevel,
             name: child.name,
             width: child.width,
             height: child.height,
@@ -345,7 +350,7 @@ async function buildGenerationTasks(
   componentNameOverride?: string,
 ): Promise<GenerationTask[]> {
   const tasks: GenerationTask[] = [];
-  const generatedChildNames = new Map<string, string>();
+  const generatedChildNames = new Map<string, GeneratedChildInfo>();
 
   if ('children' in node) {
     for (const child of (node as unknown as { children: SceneNode[] }).children) {
@@ -358,7 +363,7 @@ async function buildGenerationTasks(
 
       const childOwnTask = childTasks[childTasks.length - 1];
       if (childOwnTask) {
-        generatedChildNames.set(child.id, childOwnTask.componentName);
+        generatedChildNames.set(child.id, { componentName: childOwnTask.componentName });
       }
     }
   }

@@ -41,7 +41,7 @@
     "eslint-plugin-storybook": "^10.4.6",
     "globals": "^17.6.0",
     "playwright": "^1.61.1",
-    "postcss": "^8.5.16",
+    "postcss": "^8.5.25",
     "prettier": "^3.9.4",
     "storybook": "^10.4.6",
     "tailwindcss": "^4.3.2",
